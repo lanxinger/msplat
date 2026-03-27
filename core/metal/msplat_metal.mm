@@ -417,7 +417,7 @@ struct FusedTensorCache {
             tile_bins = mtensor_empty(dev, {nt, 2}, DType::Int32);
             tile_offsets = mtensor_empty(dev, {nt}, DType::Int32);
             tile_scatter_counters = mtensor_empty(dev, {nt}, DType::Int32);
-            prealloc_bins = mtensor_empty(dev, {(int64_t)nt * 2048}, DType::Int64);
+            prealloc_bins = mtensor_empty(dev, {(int64_t)nt * 4096}, DType::Int64);
         }
         if (!loss_sum.defined()) {
             loss_sum = mtensor_empty(dev, {1}, DType::Float32);
@@ -479,7 +479,7 @@ static void forward_pipeline(
     int tile_bounds_y = std::get<1>(tile_bounds);
     int num_tiles = tile_bounds_x * tile_bounds_y;
 
-    // --- Overflow check: detect per-tile overflow (> 2048 gaussians in a tile) ---
+    // --- Overflow check: detect per-tile overflow (> 4096 gaussians in a tile) ---
     // Only warn once to avoid noisy output (per-tile overflow is common at >1M gaussians)
     static bool overflow_warned = false;
     static int iter_count_oc = 0;
@@ -490,7 +490,7 @@ static void forward_pipeline(
         ctx->syncCB();
         int32_t flag_val = *g_tcache.overflow_flag.data<int32_t>();
         if (flag_val > 0) {
-            fprintf(stderr, "WARNING: per-tile overflow (>2048 gaussians in a tile). "
+            fprintf(stderr, "WARNING: per-tile overflow (>4096 gaussians in a tile). "
                     "Some gaussians were dropped from overfull tiles.\n");
             overflow_warned = true;
         }
@@ -527,7 +527,7 @@ static void forward_pipeline(
         (uint32_t)tile_bounds_x, (uint32_t)tile_bounds_y,
         (uint32_t)std::get<2>(tile_bounds), 0xDEAD
     });
-    auto cam_pos_arr = std::make_shared<std::array<float, 3>>(std::array<float, 3>{cam_pos[0], cam_pos[1], cam_pos[2]});
+    auto cam_pos_arr = std::make_shared<std::array<float, 4>>(std::array<float, 4>{cam_pos[0], cam_pos[1], cam_pos[2], 0.f});
     uint32_t num_points_u32 = (uint32_t)num_points;
     uint32_t capacity_u32 = (uint32_t)capacity;
     uint32_t prefix_N = (uint32_t)num_points;
@@ -546,7 +546,7 @@ static void forward_pipeline(
             fprintf(stderr, "  SH degree:      %u (bases: %u)\n", degree, (degree + 1) * (degree + 1));
             fprintf(stderr, "  features_rest:  [%lld x %lld x %lld]\n",
                 (long long)features_rest.size(0), (long long)features_rest.size(1), (long long)features_rest.size(2));
-            fprintf(stderr, "  sort:           tile-local (bitonic, max 2048/tile)\n");
+            fprintf(stderr, "  sort:           tile-local (bitonic, max 4096/tile)\n");
             fprintf(stderr, "  sort buffer:    %.1f MB (sort_pairs)\n", (double)capacity * 8.0 / 1e6);
             fprintf(stderr, "  opacities:      [%lld]\n", (long long)opacities.size(0));
             fprintf(stderr, "===========================\n\n");
@@ -795,7 +795,7 @@ std::tuple<MTensor, float> msplat_train_step(
     int tile_bounds_y = std::get<1>(tile_bounds);
     int num_tiles = tile_bounds_x * tile_bounds_y;
 
-    // --- Overflow check: detect per-tile overflow (> 2048 gaussians in a tile) ---
+    // --- Overflow check: detect per-tile overflow (> 4096 gaussians in a tile) ---
     // Only warn once to avoid noisy output (per-tile overflow is common at >1M gaussians)
     static bool overflow_warned = false;
     static int iter_count_oc = 0;
@@ -806,7 +806,7 @@ std::tuple<MTensor, float> msplat_train_step(
         ctx->syncCB();
         int32_t flag_val = *g_tcache.overflow_flag.data<int32_t>();
         if (flag_val > 0) {
-            fprintf(stderr, "WARNING: per-tile overflow (>2048 gaussians in a tile). "
+            fprintf(stderr, "WARNING: per-tile overflow (>4096 gaussians in a tile). "
                     "Some gaussians were dropped from overfull tiles.\n");
             overflow_warned = true;
         }
@@ -866,7 +866,7 @@ std::tuple<MTensor, float> msplat_train_step(
         (uint32_t)tile_bounds_x, (uint32_t)tile_bounds_y,
         (uint32_t)std::get<2>(tile_bounds), 0xDEAD
     });
-    auto cam_pos_arr = std::make_shared<std::array<float, 3>>(std::array<float, 3>{cam_pos[0], cam_pos[1], cam_pos[2]});
+    auto cam_pos_arr = std::make_shared<std::array<float, 4>>(std::array<float, 4>{cam_pos[0], cam_pos[1], cam_pos[2], 0.f});
     uint32_t num_points_u32 = (uint32_t)num_points;
     uint32_t capacity_u32 = (uint32_t)capacity;
     uint32_t prefix_N = (uint32_t)num_points;

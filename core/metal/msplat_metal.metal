@@ -2018,7 +2018,7 @@ kernel void pack_sorted_gaussians_kernel(
 // Eliminates count→prefix_sum→scatter pipeline (3 dispatches + 3 barriers saved).
 
 #define SORT_TG_SIZE 256
-#define MAX_TILE_ELEMS 2048
+#define MAX_TILE_ELEMS 4096
 
 // Scatter each gaussian's intersections directly into pre-allocated per-tile bins.
 // Each tile gets MAX_TILE_ELEMS slots. Per-tile atomics track fill count.
