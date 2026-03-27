@@ -129,6 +129,36 @@ func computeOrbitParams(_ poses: [[Float]]) -> OrbitParams {
                        up: up, tangent1: t1, tangent2: t2)
 }
 
+// MARK: - Dataset discovery
+
+struct DiscoveredDataset: Identifiable, Hashable {
+    let id = UUID()
+    let name: String
+    let path: String
+}
+
+/// Scan a directory recursively for COLMAP-style datasets (folders containing images/ and sparse/).
+func discoverDatasets(in root: URL) -> [DiscoveredDataset] {
+    let fm = FileManager.default
+    guard fm.fileExists(atPath: root.path) else { return [] }
+
+    var results: [DiscoveredDataset] = []
+    guard let enumerator = fm.enumerator(at: root, includingPropertiesForKeys: [.isDirectoryKey],
+                                          options: [.skipsHiddenFiles]) else { return [] }
+    for case let url as URL in enumerator {
+        let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+        guard isDir else { continue }
+        let images = url.appendingPathComponent("images")
+        let sparse = url.appendingPathComponent("sparse")
+        if fm.fileExists(atPath: images.path) && fm.fileExists(atPath: sparse.path) {
+            let name = url.pathComponents.suffix(2).joined(separator: "/")
+            results.append(DiscoveredDataset(name: name, path: url.path))
+            enumerator.skipDescendants()
+        }
+    }
+    return results.sorted { $0.name < $1.name }
+}
+
 // MARK: - Engine
 
 @MainActor
@@ -139,27 +169,14 @@ final class Engine: ObservableObject {
     @Published var splatCount: Int = 0
     @Published var msPerStep: Float = 0
     @Published var fps: Float = 0
-    @Published var phase: Phase = .countdown(5)
-    @Published var countdown: Int = 5
-
+    @Published var phase: Phase = .selectDataset
     enum Phase: Equatable {
-        case countdown(Int), loading, training, orbiting
+        case selectDataset, loading, training, orbiting
     }
 
     func start(datasetPath: String) {
-        phase = .countdown(5)
-        countdown = 5
-
-        // 5-second countdown on main thread
-        Task { @MainActor in
-            for s in stride(from: 4, through: 0, by: -1) {
-                try? await Task.sleep(for: .seconds(1))
-                self.countdown = s
-                self.phase = .countdown(s)
-            }
-            self.phase = .loading
-            self.beginTraining(datasetPath: datasetPath)
-        }
+        phase = .loading
+        beginTraining(datasetPath: datasetPath)
     }
 
     private func beginTraining(datasetPath: String) {
@@ -170,7 +187,7 @@ final class Engine: ObservableObject {
             let dataset = GaussianDataset(path: datasetPath)
             var config = TrainingConfig()
             config.iterations = 2_000
-            config.numDownscales = 0
+            config.numDownscales = 1
             config.bgColor = (0, 0, 0)
             let trainer = GaussianTrainer(dataset: dataset, config: config)
 
@@ -286,22 +303,23 @@ final class Engine: ObservableObject {
 
 struct ContentView: View {
     @StateObject private var engine = Engine()
-    let datasetPath: String
+    let initialDatasetPath: String?
+    let datasetsRoot: URL
 
     var body: some View {
         ZStack {
             Color.black
 
+            if engine.phase == .selectDataset {
+                DatasetPickerView(datasetsRoot: datasetsRoot) { path in
+                    engine.start(datasetPath: path)
+                }
+            }
+
             if let img = engine.image {
                 Image(nsImage: img)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-            }
-
-            if case .countdown(let s) = engine.phase {
-                Text("\(s)")
-                    .font(.system(size: 120, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.8))
             }
 
             if engine.phase == .loading {
@@ -348,7 +366,9 @@ struct ContentView: View {
             }
         }
         .onAppear {
-            engine.start(datasetPath: datasetPath)
+            if let path = initialDatasetPath {
+                engine.start(datasetPath: path)
+            }
         }
     }
 
@@ -376,7 +396,7 @@ struct ContentView: View {
     private var statsBar: some View {
         HStack(spacing: 32) {
             switch engine.phase {
-            case .countdown, .loading:
+            case .selectDataset, .loading:
                 EmptyView()
             case .training:
                 Text("step \(engine.iteration) / \(engine.totalIterations)")
@@ -401,6 +421,76 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Dataset picker
+
+struct DatasetPickerView: View {
+    let datasetsRoot: URL
+    let onSelect: (String) -> Void
+
+    @State private var datasets: [DiscoveredDataset] = []
+
+    var body: some View {
+        VStack(spacing: 32) {
+            Text("msplat")
+                .font(.system(size: 48, weight: .bold, design: .monospaced))
+                .foregroundStyle(.white)
+
+            if !datasets.isEmpty {
+                VStack(spacing: 0) {
+                    ForEach(datasets) { ds in
+                        Button { onSelect(ds.path) } label: {
+                            HStack {
+                                Image(systemName: "cube")
+                                    .foregroundStyle(.secondary)
+                                Text(ds.name)
+                                    .font(.system(size: 16, weight: .medium, design: .monospaced))
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 14)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .background(.white.opacity(0.06))
+                        .overlay(alignment: .bottom) {
+                            Rectangle().fill(.white.opacity(0.08)).frame(height: 1)
+                        }
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .frame(maxWidth: 420)
+            }
+
+            Button {
+                let panel = NSOpenPanel()
+                panel.canChooseFiles = false
+                panel.canChooseDirectories = true
+                panel.allowsMultipleSelection = false
+                panel.message = "Select a COLMAP dataset folder (contains images/ and sparse/)"
+                panel.prompt = "Select"
+                if panel.runModal() == .OK, let url = panel.url {
+                    onSelect(url.path)
+                }
+            } label: {
+                HStack {
+                    Image(systemName: "folder")
+                    Text("Open Dataset Folder...")
+                }
+                .font(.system(size: 16, weight: .medium))
+                .padding(.horizontal, 24)
+                .padding(.vertical, 12)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.white.opacity(0.15))
+        }
+        .onAppear {
+            datasets = discoverDatasets(in: datasetsRoot)
+        }
+    }
+}
+
 // MARK: - App entry
 
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -413,16 +503,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct DemoApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
-    let datasetPath: String
+
+    let initialDatasetPath: String?
+    let repoRoot: URL
 
     init() {
+        repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // DemoApp.swift -> Sources/
+            .deletingLastPathComponent()   // Sources/      -> demo/
+            .deletingLastPathComponent()   // demo/         -> repo root
+
         let args = CommandLine.arguments
-        datasetPath = args.count > 1 ? args[1] : "datasets/mipnerf360/garden"
+        if args.count > 1 {
+            initialDatasetPath = args[1]
+        } else {
+            initialDatasetPath = nil
+        }
     }
 
     var body: some Scene {
         WindowGroup {
-            ContentView(datasetPath: datasetPath)
+            ContentView(initialDatasetPath: initialDatasetPath,
+                        datasetsRoot: repoRoot.appendingPathComponent("datasets"))
                 .frame(minWidth: 960, minHeight: 640)
         }
         .defaultSize(width: 1280, height: 720)

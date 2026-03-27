@@ -4,7 +4,7 @@ import PackageDescription
 
 let package = Package(
     name: "DemoApp",
-    platforms: [.macOS(.v15)],
+    platforms: [.macOS("26.0")],
     dependencies: [
         .package(path: "../swift"),
     ],
