@@ -14,6 +14,11 @@
 typedef void* MTLBufferRef;  // opaque handle in pure C++
 #endif
 
+// CFRelease is needed in both C++ and ObjC++ to release retained Metal buffers.
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
+#endif
+
 enum class DType : uint8_t {
     Float32,
     Int32,
@@ -33,14 +38,16 @@ inline size_t dtypeSize(DType dt) {
 }
 
 // Lightweight GPU tensor — wraps an MTLBuffer with shape metadata.
+// Ownership: GPU-allocated tensors own their Metal buffer (released on destruction).
+// Copies are non-owning aliases. Moves transfer ownership. Views are non-owning.
 class MTensor {
 public:
     MTensor() = default;
 
 #ifdef __OBJC__
-    // GPU allocation (Objective-C++ only)
+    // GPU allocation (Objective-C++ only) — creates an owning tensor.
     MTensor(id<MTLDevice> device, std::vector<int64_t> shape, DType dtype)
-        : _shape(std::move(shape)), _dtype(dtype) {
+        : _shape(std::move(shape)), _dtype(dtype), _owning(true) {
         _numel = 1;
         for (auto s : _shape) _numel *= s;
         size_t bytes = _numel * dtypeSize(_dtype);
@@ -61,6 +68,57 @@ public:
         size_t bytes = _numel * dtypeSize(_dtype);
         _cpu_data.resize(bytes);
     }
+
+    // Copy constructor: non-owning alias (shares buffer without retaining).
+    MTensor(const MTensor& o)
+        : _buffer(o._buffer), _data(o._data), _cpu_data(o._cpu_data),
+          _shape(o._shape), _dtype(o._dtype), _numel(o._numel), _owning(false) {}
+
+    // Move constructor: transfers ownership.
+    MTensor(MTensor&& o) noexcept
+        : _buffer(o._buffer), _data(o._data), _cpu_data(std::move(o._cpu_data)),
+          _shape(std::move(o._shape)), _dtype(o._dtype), _numel(o._numel), _owning(o._owning) {
+        o._buffer = nullptr;
+        o._data = nullptr;
+        o._numel = 0;
+        o._owning = false;
+    }
+
+    // Copy assignment: non-owning alias.
+    MTensor& operator=(const MTensor& o) {
+        if (this != &o) {
+            releaseBuffer();
+            _buffer = o._buffer;
+            _data = o._data;
+            _cpu_data = o._cpu_data;
+            _shape = o._shape;
+            _dtype = o._dtype;
+            _numel = o._numel;
+            _owning = false;
+        }
+        return *this;
+    }
+
+    // Move assignment: transfers ownership, releases old buffer if owning.
+    MTensor& operator=(MTensor&& o) noexcept {
+        if (this != &o) {
+            releaseBuffer();
+            _buffer = o._buffer;
+            _data = o._data;
+            _cpu_data = std::move(o._cpu_data);
+            _shape = std::move(o._shape);
+            _dtype = o._dtype;
+            _numel = o._numel;
+            _owning = o._owning;
+            o._buffer = nullptr;
+            o._data = nullptr;
+            o._numel = 0;
+            o._owning = false;
+        }
+        return *this;
+    }
+
+    ~MTensor() { releaseBuffer(); }
 
     bool defined() const { return _buffer != nullptr || !_cpu_data.empty(); }
     bool isGpu() const { return _buffer != nullptr; }
@@ -100,9 +158,7 @@ public:
     }
 
     void reset() {
-#ifdef __OBJC__
-        if (_buffer) { CFRelease(_buffer); }
-#endif
+        releaseBuffer();
         _buffer = nullptr;
         _data = nullptr;
         _cpu_data.clear();
@@ -119,13 +175,12 @@ public:
     }
 
     // Create a view of the first `n` elements along dim 0.
-    // WARNING: Non-owning — shares the underlying MTLBuffer without retaining it.
+    // Non-owning — shares the underlying MTLBuffer without retaining it.
     // The caller MUST ensure the parent MTensor outlives all views.
-    // Use-after-free if the parent is destroyed while a view exists.
     MTensor view(int64_t n) const {
         MTensor v;
-        v._buffer = _buffer;  // shares the buffer (non-owning)
-        v._data = _data;      // shares the CPU-accessible pointer
+        v._buffer = _buffer;  // shares the buffer (non-owning, _owning stays false)
+        v._data = _data;
         v._shape = _shape;
         v._shape[0] = n;
         v._dtype = _dtype;
@@ -134,12 +189,22 @@ public:
     }
 
 private:
+    void releaseBuffer() {
+#ifdef __APPLE__
+        if (_owning && _buffer) {
+            CFRelease(_buffer);
+        }
+#endif
+        _owning = false;
+    }
+
     void* _buffer = nullptr;  // retained id<MTLBuffer> as void*
     void* _data = nullptr;    // cached CPU-accessible pointer (shared memory on Apple Silicon)
     std::vector<uint8_t> _cpu_data;
     std::vector<int64_t> _shape;
     DType _dtype = DType::Float32;
     int64_t _numel = 0;
+    bool _owning = false;     // true if this instance owns (must CFRelease) _buffer
 };
 
 // Factory helpers (Objective-C++ only)

@@ -204,7 +204,7 @@ void Model::ensureCapacity(int needed){
         MTensor new_buf = gpu_zeros(shape, DType::Float32);
         size_t copy_bytes = num_active * buf.stride0() * sizeof(float);
         memcpy(new_buf.data_ptr(), buf.data_ptr(), copy_bytes);
-        buf = new_buf;
+        buf = std::move(new_buf);
     };
     grow(means_buf); grow(scales_buf); grow(quats_buf);
     grow(featuresDc_buf); grow(featuresRest_buf); grow(opacities_buf);
@@ -462,8 +462,8 @@ int Model::loadCheckpoint(const std::string &filename) {
         MTensor sq_buf = gpu_zeros(shape, DType::Float32);
         memcpy(avg_buf.data_ptr(), adam_exp_avg[g].data_ptr(), adam_exp_avg[g].nbytes());
         memcpy(sq_buf.data_ptr(), adam_exp_avg_sq[g].data_ptr(), adam_exp_avg_sq[g].nbytes());
-        adam_exp_avg_buf[g] = avg_buf;
-        adam_exp_avg_sq_buf[g] = sq_buf;
+        adam_exp_avg_buf[g] = std::move(avg_buf);
+        adam_exp_avg_sq_buf[g] = std::move(sq_buf);
     }
 
     // Allocate densification scratch buffers
