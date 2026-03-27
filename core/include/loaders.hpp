@@ -17,8 +17,8 @@ Points readPly(const std::string &path);
 Points readColmapPoints(const std::string &path);
 
 // Image I/O
-Image imreadRGB(const std::string &path);       // returns float32 [0,1] directly
-Mask imreadMask(const std::string &path);        // returns single-channel float32 [0,1]
+Image imreadRGB(const std::string &path, int maxDim = 0);  // maxDim>0: subsample decode
+Mask imreadMask(const std::string &path, int maxDim = 0);  // maxDim>0: subsample decode
 Image resizeArea(const Image &src, int dstW, int dstH);  // box-filter downscale
 Mask resizeAreaMask(const Mask &src, int dstW, int dstH);  // box-filter downscale (single channel)
 void imwriteRGB(const std::string &path, const Image &img);  // save as PNG

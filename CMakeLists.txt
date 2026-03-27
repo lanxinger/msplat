@@ -51,6 +51,7 @@ find_library(MPS_FRAMEWORK MetalPerformanceShaders REQUIRED)
 
 find_library(IMAGEIO_FRAMEWORK ImageIO REQUIRED)
 find_library(COREGRAPHICS_FRAMEWORK CoreGraphics REQUIRED)
+find_library(ACCELERATE_FRAMEWORK Accelerate REQUIRED)
 
 # --- Compile Metal shaders ---
 
@@ -98,6 +99,7 @@ target_link_libraries(msplat_core PUBLIC
     ${MPS_FRAMEWORK}
     ${IMAGEIO_FRAMEWORK}
     ${COREGRAPHICS_FRAMEWORK}
+    ${ACCELERATE_FRAMEWORK}
     nlohmann_json::nlohmann_json
     nanoflann::nanoflann
 )

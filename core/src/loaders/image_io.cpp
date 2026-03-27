@@ -6,10 +6,13 @@
 
 #include <CoreGraphics/CoreGraphics.h>
 #include <ImageIO/ImageIO.h>
+#define ACCELERATE_NEW_LAPACK
+#include <Accelerate/Accelerate.h>
+#include <dispatch/dispatch.h>
 
 // ── Image loading (CoreGraphics) ─────────────────────────────────────────────
 
-Image imreadRGB(const std::string &path) {
+Image imreadRGB(const std::string &path, int maxDim) {
     CFStringRef cfPath = CFStringCreateWithCString(nullptr, path.c_str(), kCFStringEncodingUTF8);
     CFURLRef url = CFURLCreateWithFileSystemPath(nullptr, cfPath, kCFURLPOSIXPathStyle, false);
     CFRelease(cfPath);
@@ -20,7 +23,21 @@ Image imreadRGB(const std::string &path) {
         throw std::runtime_error("Failed to load image: " + path);
     }
 
-    CGImageRef cgImage = CGImageSourceCreateImageAtIndex(source, 0, nullptr);
+    CGImageRef cgImage = nullptr;
+    if (maxDim > 0) {
+        // Subsample decode: decode at reduced resolution directly
+        CFMutableDictionaryRef opts = CFDictionaryCreateMutable(nullptr, 0,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        CFNumberRef maxDimRef = CFNumberCreate(nullptr, kCFNumberIntType, &maxDim);
+        CFDictionarySetValue(opts, kCGImageSourceThumbnailMaxPixelSize, maxDimRef);
+        CFDictionarySetValue(opts, kCGImageSourceCreateThumbnailFromImageAlways, kCFBooleanTrue);
+        // Keep the stored pixel orientation so camera intrinsics remain valid.
+        cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, opts);
+        CFRelease(maxDimRef);
+        CFRelease(opts);
+    } else {
+        cgImage = CGImageSourceCreateImageAtIndex(source, 0, nullptr);
+    }
     CFRelease(source);
     if (!cgImage) {
         throw std::runtime_error("Failed to decode image: " + path);
@@ -41,22 +58,29 @@ Image imreadRGB(const std::string &path) {
     CGColorSpaceRelease(colorSpace);
     CGImageRelease(cgImage);
 
-    // RGBA → float32 RGB [0,1]
+    // RGBA uint8 → float32 RGB [0,1] via Accelerate
+    int n = w * h;
     Image img;
     img.width = w;
     img.height = h;
-    img.data.resize(w * h * 3);
-    for (int i = 0; i < w * h; i++) {
-        img.data[i * 3 + 0] = rgba[i * 4 + 0] / 255.0f;
-        img.data[i * 3 + 1] = rgba[i * 4 + 1] / 255.0f;
-        img.data[i * 3 + 2] = rgba[i * 4 + 2] / 255.0f;
-    }
+
+    // Convert entire RGBA buffer to float in one vectorised pass
+    std::vector<float> rgbaF(n * 4);
+    vDSP_vfltu8(rgba.data(), 1, rgbaF.data(), 1, n * 4);
+    float scale = 1.0f / 255.0f;
+    vDSP_vsmul(rgbaF.data(), 1, &scale, rgbaF.data(), 1, n * 4);
+
+    // Extract R, G, B channels (stride-4 → stride-3) via BLAS
+    img.data.resize(n * 3);
+    cblas_scopy(n, &rgbaF[0], 4, &img.data[0], 3);  // R
+    cblas_scopy(n, &rgbaF[1], 4, &img.data[1], 3);  // G
+    cblas_scopy(n, &rgbaF[2], 4, &img.data[2], 3);  // B
     return img;
 }
 
 // ── Mask loading (CoreGraphics, single-channel) ─────────────────────────────
 
-Mask imreadMask(const std::string &path) {
+Mask imreadMask(const std::string &path, int maxDim) {
     CFStringRef cfPath = CFStringCreateWithCString(nullptr, path.c_str(), kCFStringEncodingUTF8);
     CFURLRef url = CFURLCreateWithFileSystemPath(nullptr, cfPath, kCFURLPOSIXPathStyle, false);
     CFRelease(cfPath);
@@ -65,7 +89,20 @@ Mask imreadMask(const std::string &path) {
     CFRelease(url);
     if (!source) throw std::runtime_error("Failed to load mask: " + path);
 
-    CGImageRef cgImage = CGImageSourceCreateImageAtIndex(source, 0, nullptr);
+    CGImageRef cgImage = nullptr;
+    if (maxDim > 0) {
+        CFMutableDictionaryRef opts = CFDictionaryCreateMutable(nullptr, 0,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        CFNumberRef maxDimRef = CFNumberCreate(nullptr, kCFNumberIntType, &maxDim);
+        CFDictionarySetValue(opts, kCGImageSourceThumbnailMaxPixelSize, maxDimRef);
+        CFDictionarySetValue(opts, kCGImageSourceCreateThumbnailFromImageAlways, kCFBooleanTrue);
+        // Keep the stored pixel orientation so masks stay aligned with the cameras.
+        cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, opts);
+        CFRelease(maxDimRef);
+        CFRelease(opts);
+    } else {
+        cgImage = CGImageSourceCreateImageAtIndex(source, 0, nullptr);
+    }
     CFRelease(source);
     if (!cgImage) throw std::runtime_error("Failed to decode mask: " + path);
 
@@ -84,48 +121,50 @@ Mask imreadMask(const std::string &path) {
     CGColorSpaceRelease(colorSpace);
     CGImageRelease(cgImage);
 
-    // Convert to grayscale via luminance (handles colored masks correctly)
+    // Convert to grayscale via luminance using Accelerate
+    int n = w * h;
     Mask m;
     m.width = w;
     m.height = h;
-    m.data.resize(w * h);
-    for (int i = 0; i < w * h; i++)
-        m.data[i] = (0.299f * rgba[i * 4] + 0.587f * rgba[i * 4 + 1] + 0.114f * rgba[i * 4 + 2]) / 255.0f;
+
+    // Convert RGBA uint8 → float
+    std::vector<float> rgbaF(n * 4);
+    vDSP_vfltu8(rgba.data(), 1, rgbaF.data(), 1, n * 4);
+
+    // Extract R, G, B into separate planes and compute weighted sum
+    std::vector<float> rPlane(n), gPlane(n), bPlane(n);
+    cblas_scopy(n, &rgbaF[0], 4, rPlane.data(), 1);
+    cblas_scopy(n, &rgbaF[1], 4, gPlane.data(), 1);
+    cblas_scopy(n, &rgbaF[2], 4, bPlane.data(), 1);
+
+    // luminance = 0.299*R + 0.587*G + 0.114*B, then /255
+    float wr = 0.299f / 255.0f, wg = 0.587f / 255.0f, wb = 0.114f / 255.0f;
+    m.data.resize(n);
+    vDSP_vsmul(rPlane.data(), 1, &wr, m.data.data(), 1, n);       // out = R*wr
+    vDSP_vsma(gPlane.data(), 1, &wg, m.data.data(), 1, m.data.data(), 1, n); // out += G*wg
+    vDSP_vsma(bPlane.data(), 1, &wb, m.data.data(), 1, m.data.data(), 1, n); // out += B*wb
     return m;
 }
 
-// ── Area-based mask resize (box filter, single channel) ─────────────────────
+// ── Area-based mask resize (vImage Accelerate, single channel) ───────────────
 
 Mask resizeAreaMask(const Mask &src, int dstW, int dstH) {
     Mask dst;
     dst.width = dstW;
     dst.height = dstH;
-    dst.data.resize(dstW * dstH, 0.0f);
+    dst.data.resize(dstW * dstH);
 
-    float scaleX = (float)src.width / dstW;
-    float scaleY = (float)src.height / dstH;
-
-    for (int dy = 0; dy < dstH; dy++) {
-        float srcY0 = dy * scaleY;
-        float srcY1 = (dy + 1) * scaleY;
-        for (int dx = 0; dx < dstW; dx++) {
-            float srcX0 = dx * scaleX;
-            float srcX1 = (dx + 1) * scaleX;
-            float sum = 0, totalArea = 0;
-            int iy0 = (int)srcY0, iy1 = std::min((int)std::ceil(srcY1), src.height);
-            int ix0 = (int)srcX0, ix1 = std::min((int)std::ceil(srcX1), src.width);
-            for (int iy = iy0; iy < iy1; iy++) {
-                float wy = std::min((float)(iy + 1), srcY1) - std::max((float)iy, srcY0);
-                for (int ix = ix0; ix < ix1; ix++) {
-                    float wx = std::min((float)(ix + 1), srcX1) - std::max((float)ix, srcX0);
-                    float area = wx * wy;
-                    sum += src.data[iy * src.width + ix] * area;
-                    totalArea += area;
-                }
-            }
-            dst.data[dy * dstW + dx] = sum / totalArea;
-        }
-    }
+    vImage_Buffer srcBuf = {
+        const_cast<float*>(src.data.data()),
+        (vImagePixelCount)src.height, (vImagePixelCount)src.width,
+        (size_t)(src.width * sizeof(float))
+    };
+    vImage_Buffer dstBuf = {
+        dst.data.data(),
+        (vImagePixelCount)dstH, (vImagePixelCount)dstW,
+        (size_t)(dstW * sizeof(float))
+    };
+    vImageScale_PlanarF(&srcBuf, &dstBuf, nullptr, kvImageHighQualityResampling);
     return dst;
 }
 
@@ -163,53 +202,43 @@ void imwriteRGB(const std::string &path, const Image &img) {
     CGImageRelease(cgImage);
 }
 
-// ── Area-based image resize (box filter) ─────────────────────────────────────
+// ── Area-based image resize (vImage Accelerate) ──────────────────────────────
 
 Image resizeArea(const Image &src, int dstW, int dstH) {
+    int srcN = src.width * src.height;
+    int dstN = dstW * dstH;
+
+    // Split interleaved RGB into 3 planar buffers
+    std::vector<float> srcR(srcN), srcG(srcN), srcB(srcN);
+    cblas_scopy(srcN, &src.data[0], 3, srcR.data(), 1);
+    cblas_scopy(srcN, &src.data[1], 3, srcG.data(), 1);
+    cblas_scopy(srcN, &src.data[2], 3, srcB.data(), 1);
+
+    std::vector<float> dstR(dstN), dstG(dstN), dstB(dstN);
+
+    vImage_Buffer srcBuf, dstBuf;
+    srcBuf.height = src.height; srcBuf.width = src.width;
+    srcBuf.rowBytes = src.width * sizeof(float);
+    dstBuf.height = dstH; dstBuf.width = dstW;
+    dstBuf.rowBytes = dstW * sizeof(float);
+
+    // Scale each plane with high-quality resampling
+    float *srcPlanes[] = {srcR.data(), srcG.data(), srcB.data()};
+    float *dstPlanes[] = {dstR.data(), dstG.data(), dstB.data()};
+    for (int c = 0; c < 3; c++) {
+        srcBuf.data = srcPlanes[c];
+        dstBuf.data = dstPlanes[c];
+        vImageScale_PlanarF(&srcBuf, &dstBuf, nullptr, kvImageHighQualityResampling);
+    }
+
+    // Recombine into interleaved RGB
     Image dst;
     dst.width = dstW;
     dst.height = dstH;
-    dst.data.resize(dstW * dstH * 3, 0.0f);
-
-    float scaleX = (float)src.width / dstW;
-    float scaleY = (float)src.height / dstH;
-
-    for (int dy = 0; dy < dstH; dy++) {
-        float srcY0 = dy * scaleY;
-        float srcY1 = (dy + 1) * scaleY;
-
-        for (int dx = 0; dx < dstW; dx++) {
-            float srcX0 = dx * scaleX;
-            float srcX1 = (dx + 1) * scaleX;
-
-            float sum[3] = {};
-            float totalArea = 0;
-
-            int iy0 = (int)srcY0;
-            int iy1 = std::min((int)std::ceil(srcY1), src.height);
-            int ix0 = (int)srcX0;
-            int ix1 = std::min((int)std::ceil(srcX1), src.width);
-
-            for (int iy = iy0; iy < iy1; iy++) {
-                float wy = std::min((float)(iy + 1), srcY1) - std::max((float)iy, srcY0);
-                for (int ix = ix0; ix < ix1; ix++) {
-                    float wx = std::min((float)(ix + 1), srcX1) - std::max((float)ix, srcX0);
-                    float area = wx * wy;
-                    const float *p = &src.data[(iy * src.width + ix) * 3];
-                    sum[0] += p[0] * area;
-                    sum[1] += p[1] * area;
-                    sum[2] += p[2] * area;
-                    totalArea += area;
-                }
-            }
-
-            float *out = &dst.data[(dy * dstW + dx) * 3];
-            float inv = 1.0f / totalArea;
-            out[0] = sum[0] * inv;
-            out[1] = sum[1] * inv;
-            out[2] = sum[2] * inv;
-        }
-    }
+    dst.data.resize(dstN * 3);
+    cblas_scopy(dstN, dstR.data(), 1, &dst.data[0], 3);
+    cblas_scopy(dstN, dstG.data(), 1, &dst.data[1], 3);
+    cblas_scopy(dstN, dstB.data(), 1, &dst.data[2], 3);
     return dst;
 }
 
@@ -351,29 +380,33 @@ UndistortResult undistortImage(const Image &src,
     if (roiW <= 0 || roiH <= 0) { roiX = 0; roiY = 0; roiW = w; roiH = h; }
 
     // Undistort: for each pixel in the output (undistorted) image,
-    // apply forward distortion to find source pixel in distorted input
+    // apply forward distortion to find source pixel in distorted input.
+    // Parallelised across rows via GCD.
     Image undist;
     undist.width = w;
     undist.height = h;
     undist.data.resize(w * h * 3);
 
-    for (int oy = 0; oy < h; oy++) {
-        for (int ox = 0; ox < w; ox++) {
-            float x = ((float)ox - cx) / fx;
-            float y = ((float)oy - cy) / fy;
-            float xd_n, yd_n;
-            distortPoint(x, y, k1, k2, p1, p2, k3, xd_n, yd_n);
-            float srcX = xd_n * fx + cx;
-            float srcY = yd_n * fy + cy;
+    const Image &srcRef = src;
+    float *dstPtr = undist.data.data();
+    dispatch_apply(h, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+        ^(size_t oy) {
+            float rowY = ((float)oy - cy) / fy;
+            for (int ox = 0; ox < w; ox++) {
+                float x = ((float)ox - cx) / fx;
+                float xd_n, yd_n;
+                distortPoint(x, rowY, k1, k2, p1, p2, k3, xd_n, yd_n);
+                float srcX = xd_n * fx + cx;
+                float srcY = yd_n * fy + cy;
 
-            float pixel[3];
-            bilinearSample(src, srcX, srcY, pixel);
-            float *out = &undist.data[(oy * w + ox) * 3];
-            out[0] = pixel[0];
-            out[1] = pixel[1];
-            out[2] = pixel[2];
-        }
-    }
+                float pixel[3];
+                bilinearSample(srcRef, srcX, srcY, pixel);
+                float *out = &dstPtr[(oy * w + ox) * 3];
+                out[0] = pixel[0];
+                out[1] = pixel[1];
+                out[2] = pixel[2];
+            }
+        });
 
     // Crop to ROI
     Image cropped;
@@ -421,23 +454,27 @@ Mask undistortMask(const Mask &src,
 {
     int w = src.width, h = src.height;
 
-    // Remap: for each pixel in undistorted space, find source in distorted input
+    // Remap: for each pixel in undistorted space, find source in distorted input.
+    // Parallelised across rows via GCD.
     Mask undist;
     undist.width = w;
     undist.height = h;
     undist.data.resize(w * h);
 
-    for (int oy = 0; oy < h; oy++) {
-        for (int ox = 0; ox < w; ox++) {
-            float x = ((float)ox - cx) / fx;
-            float y = ((float)oy - cy) / fy;
-            float xd_n, yd_n;
-            distortPoint(x, y, k1, k2, p1, p2, k3, xd_n, yd_n);
-            float srcX = xd_n * fx + cx;
-            float srcY = yd_n * fy + cy;
-            undist.data[oy * w + ox] = bilinearSampleMask(src, srcX, srcY);
-        }
-    }
+    const Mask &srcRef = src;
+    float *dstPtr = undist.data.data();
+    dispatch_apply(h, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+        ^(size_t oy) {
+            float rowY = ((float)oy - cy) / fy;
+            for (int ox = 0; ox < w; ox++) {
+                float x = ((float)ox - cx) / fx;
+                float xd_n, yd_n;
+                distortPoint(x, rowY, k1, k2, p1, p2, k3, xd_n, yd_n);
+                float srcX = xd_n * fx + cx;
+                float srcY = yd_n * fy + cy;
+                dstPtr[oy * w + ox] = bilinearSampleMask(srcRef, srcX, srcY);
+            }
+        });
 
     // Crop to same ROI as image
     Mask cropped;
