@@ -21,10 +21,12 @@ public class GaussianDataset {
     ///   - downscaleFactor: Image downscale factor (1.0 = full resolution).
     ///   - evalMode: If true, split cameras into train/test sets.
     ///   - testEvery: Hold out every Nth image for evaluation.
+    ///   - maxCameras: Maximum cameras to load (0 = all). Evenly subsamples when limiting.
     public init(path: String, downscaleFactor: Float = 1.0,
-                evalMode: Bool = false, testEvery: Int32 = 8) {
+                evalMode: Bool = false, testEvery: Int32 = 8,
+                maxCameras: Int32 = 0) {
         ensureMetallibConfigured()
-        handle = msplat_dataset_create(path, downscaleFactor, evalMode, testEvery)
+        handle = msplat_dataset_create(path, downscaleFactor, evalMode, testEvery, maxCameras)
     }
 
     deinit {

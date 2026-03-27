@@ -49,7 +49,8 @@ struct Camera {
     Mask getMask(int downscaleFactor);
     MTensor& getGPUImage(int downscaleFactor);
     MTensor& getGPUMask(int downscaleFactor);
-    bool hasMask() const { return !mask.empty(); }
+    void releaseCPUData();  // free CPU images/masks after GPU upload
+    bool hasMask() const { return !mask.empty() || !mtensorMaskCache.empty(); }
     bool hasDistortion() const { return k1 != 0 || k2 != 0 || k3 != 0 || p1 != 0 || p2 != 0; }
 };
 

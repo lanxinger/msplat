@@ -82,7 +82,8 @@ typedef struct {
 typedef void* MsplatDataset;
 
 MsplatDataset msplat_dataset_create(const char* path, float downscaleFactor,
-                                     bool evalMode, int testEvery);
+                                     bool evalMode, int testEvery,
+                                     int maxCameras);
 void msplat_dataset_destroy(MsplatDataset ds);
 int msplat_dataset_num_train(MsplatDataset ds);
 int msplat_dataset_num_test(MsplatDataset ds);

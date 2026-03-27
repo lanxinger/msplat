@@ -10,8 +10,13 @@
 
 #include <chrono>
 #include <algorithm>
+#include <atomic>
+#include <exception>
+#include <mutex>
 #include <numeric>
 #include <random>
+
+#include <dispatch/dispatch.h>
 
 namespace msplat {
 
@@ -24,13 +29,52 @@ struct Dataset::Impl {
 };
 
 Dataset::Dataset(const std::string& path, float downscaleFactor,
-                 bool evalMode, int testEvery)
+                 bool evalMode, int testEvery, int maxCameras)
     : impl(std::make_unique<Impl>())
 {
     impl->data = inputDataFromX(path);
 
-    for (auto& cam : impl->data.cameras)
-        cam.loadImage(downscaleFactor);
+    // Subsample cameras if maxCameras is set (0 = use all)
+    if (maxCameras > 0 && (int)impl->data.cameras.size() > maxCameras) {
+        int totalCameras = (int)impl->data.cameras.size();
+        std::vector<Camera> subset;
+        subset.reserve(maxCameras);
+        for (int sample = 0; sample < maxCameras; ++sample) {
+            int idx = (int)(((int64_t)sample * 2 + 1) * totalCameras / (2 * maxCameras));
+            idx = std::min(idx, totalCameras - 1);
+            subset.push_back(std::move(impl->data.cameras[idx]));
+        }
+        impl->data.cameras = std::move(subset);
+    }
+
+    size_t total = impl->data.cameras.size();
+    if (total <= 1) {
+        for (auto& cam : impl->data.cameras)
+            cam.loadImage(downscaleFactor);
+    } else {
+        std::atomic<bool> loadFailed{false};
+        std::atomic<bool> *loadFailedPtr = &loadFailed;
+        std::exception_ptr loadErr{};
+        std::exception_ptr *loadErrPtr = &loadErr;
+        std::mutex loadErrMutex;
+        std::mutex *loadErrMutexPtr = &loadErrMutex;
+        Camera *cams = impl->data.cameras.data();
+        float dsf = downscaleFactor;
+
+        dispatch_apply(total, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+            ^(size_t i) {
+                if (loadFailedPtr->load(std::memory_order_relaxed)) return;
+                try {
+                    cams[i].loadImage(dsf);
+                } catch (...) {
+                    loadFailedPtr->store(true, std::memory_order_relaxed);
+                    std::lock_guard<std::mutex> lock(*loadErrMutexPtr);
+                    if (!*loadErrPtr) *loadErrPtr = std::current_exception();
+                }
+            });
+
+        if (loadErr) std::rethrow_exception(loadErr);
+    }
 
     if (evalMode) {
         auto split = impl->data.splitTrainTest(testEvery);
@@ -96,6 +140,27 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
         config.bgColor
     );
 
+    // Pre-warm GPU image caches for all progressive resolution levels, then free CPU copies.
+    // Parallelised across cameras — pyramid building (resizeArea) is CPU-bound and benefits
+    // from multi-core; Metal buffer creation (gpu_empty) is thread-safe.
+    int nds = config.numDownscales;
+    auto warmAndRelease = [nds](std::vector<Camera>& cams) {
+        if (cams.empty()) return;
+        Camera *camPtr = cams.data();
+        int nd = nds;
+        dispatch_apply(cams.size(), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+            ^(size_t i) {
+                for (int d = nd; d >= 0; d--) {
+                    int ds = 1 << d;
+                    camPtr[i].getGPUImage(ds);
+                    if (camPtr[i].hasMask()) camPtr[i].getGPUMask(ds);
+                }
+                camPtr[i].releaseCPUData();
+            });
+    };
+    warmAndRelease(impl->ds->trainCams);
+    warmAndRelease(impl->ds->testCams);
+
     impl->camIndices.resize(impl->ds->trainCams.size());
     std::iota(impl->camIndices.begin(), impl->camIndices.end(), 0);
     impl->shuffleCameras();
@@ -110,10 +175,11 @@ Stats Trainer::step() {
 
     int ds = impl->model->getDownscaleFactor(impl->currentStep);
     MTensor& gt = cam.getGPUImage(ds);
+    MTensor *maskPtr = cam.hasMask() ? &cam.getGPUMask(ds) : nullptr;
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    impl->model->fullIteration(cam, impl->currentStep, gt, impl->config.ssimWeight);
+    impl->model->fullIteration(cam, impl->currentStep, gt, impl->config.ssimWeight, maskPtr);
     impl->model->schedulersStep(impl->currentStep);
     impl->model->afterTrain(impl->currentStep);
     msplat_commit();
@@ -298,8 +364,9 @@ static msplat::Config configFromC(MsplatConfig c) {
 }
 
 MsplatDataset msplat_dataset_create(const char* path, float downscaleFactor,
-                                     bool evalMode, int testEvery) {
-    auto* ds = new msplat::Dataset(std::string(path), downscaleFactor, evalMode, testEvery);
+                                     bool evalMode, int testEvery,
+                                     int maxCameras) {
+    auto* ds = new msplat::Dataset(std::string(path), downscaleFactor, evalMode, testEvery, maxCameras);
     return static_cast<MsplatDataset>(ds);
 }
 

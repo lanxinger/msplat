@@ -176,6 +176,15 @@ MTensor& Camera::getGPUMask(int downscaleFactor) {
     return mtensorMaskCache[downscaleFactor];
 }
 
+void Camera::releaseCPUData() {
+    image.data.clear(); image.data.shrink_to_fit();
+    image.width = image.height = 0;
+    mask.data.clear(); mask.data.shrink_to_fit();
+    mask.width = mask.height = 0;
+    imagePyramids.clear();
+    maskPyramids.clear();
+}
+
 // ── Scale & center ──────────────────────────────────────────────────────────
 
 void autoScaleAndCenter(InputData &data) {
