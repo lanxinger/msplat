@@ -304,6 +304,43 @@ void Trainer::renderFromPoseToBuffer(const float camToWorld[16], int refCameraIn
     }
 }
 
+void Trainer::renderWithIntrinsicsToBuffer(const float camToWorld[16],
+    int width, int height, float fx, float fy, float cx, float cy,
+    uint8_t* outRGBA, int* outWidth, int* outHeight) {
+    Camera cam;
+    cam.width = width; cam.height = height;
+    cam.fx = fx; cam.fy = fy; cam.cx = cx; cam.cy = cy;
+    memcpy(cam.camToWorld, camToWorld, 16 * sizeof(float));
+
+    // Use config.iterations as step to ensure downscale factor = 1
+    MTensor rgb = impl->model->render(cam, impl->config.iterations);
+    msplat_gpu_sync();
+
+    int h = (int)rgb.size(0), w = (int)rgb.size(1);
+    *outWidth = w; *outHeight = h;
+    if (!outRGBA) return;
+
+    const float* src = (const float*)rgb.data_ptr();
+    int n = w * h;
+    for (int i = 0; i < n; i++) {
+        outRGBA[i * 4]     = (uint8_t)(fminf(fmaxf(src[i*3],   0.f), 1.f) * 255.f);
+        outRGBA[i * 4 + 1] = (uint8_t)(fminf(fmaxf(src[i*3+1], 0.f), 1.f) * 255.f);
+        outRGBA[i * 4 + 2] = (uint8_t)(fminf(fmaxf(src[i*3+2], 0.f), 1.f) * 255.f);
+        outRGBA[i * 4 + 3] = 255;
+    }
+}
+
+void Trainer::renderWithFovToBuffer(const float camToWorld[16],
+    int width, int height, float fovY,
+    uint8_t* outRGBA, int* outWidth, int* outHeight) {
+    float fy = (float)height / (2.0f * tanf(fovY * 0.5f));
+    float fx = fy;
+    float cx = (float)width / 2.0f;
+    float cy = (float)height / 2.0f;
+    renderWithIntrinsicsToBuffer(camToWorld, width, height, fx, fy, cx, cy,
+                                 outRGBA, outWidth, outHeight);
+}
+
 void Trainer::exportPly(const std::string& path) {
     impl->model->savePly(path, impl->currentStep);
 }
@@ -430,6 +467,13 @@ void msplat_trainer_render_pose_to_buffer(MsplatTrainer t, const float camToWorl
                                       int* outWidth, int* outHeight) {
     static_cast<msplat::Trainer*>(t)->renderFromPoseToBuffer(
         camToWorld, refCameraIndex, outRGBA, outWidth, outHeight);
+}
+
+void msplat_trainer_render_fov_to_buffer(MsplatTrainer t, const float camToWorld[16],
+                                      int width, int height, float fovY,
+                                      uint8_t* outRGBA, int* outWidth, int* outHeight) {
+    static_cast<msplat::Trainer*>(t)->renderWithFovToBuffer(
+        camToWorld, width, height, fovY, outRGBA, outWidth, outHeight);
 }
 
 void msplat_trainer_export_ply(MsplatTrainer t, const char* path) {

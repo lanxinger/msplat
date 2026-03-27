@@ -133,6 +133,16 @@ public:
     void renderFromPoseToBuffer(const float camToWorld[16], int refCameraIndex,
                             uint8_t* outRGBA, int* outWidth, int* outHeight);
 
+    /// Render with explicit intrinsics (no reference camera needed).
+    void renderWithIntrinsicsToBuffer(const float camToWorld[16],
+        int width, int height, float fx, float fy, float cx, float cy,
+        uint8_t* outRGBA, int* outWidth, int* outHeight);
+
+    /// Render with a vertical FOV and output resolution (convenience wrapper).
+    void renderWithFovToBuffer(const float camToWorld[16],
+        int width, int height, float fovY,
+        uint8_t* outRGBA, int* outWidth, int* outHeight);
+
     /// Export scene to PLY format.
     void exportPly(const std::string& path);
 

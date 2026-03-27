@@ -107,6 +107,10 @@ MsplatPixelBuffer msplat_trainer_render_pose(MsplatTrainer t, const float camToW
 void msplat_trainer_render_pose_to_buffer(MsplatTrainer t, const float camToWorld[16],
                                       int refCameraIndex, uint8_t* outRGBA,
                                       int* outWidth, int* outHeight);
+/// Render with explicit intrinsics (no reference camera). Same buffer semantics as above.
+void msplat_trainer_render_fov_to_buffer(MsplatTrainer t, const float camToWorld[16],
+                                      int width, int height, float fovY,
+                                      uint8_t* outRGBA, int* outWidth, int* outHeight);
 void msplat_trainer_export_ply(MsplatTrainer t, const char* path);
 void msplat_trainer_export_splat(MsplatTrainer t, const char* path);
 void msplat_trainer_save_checkpoint(MsplatTrainer t, const char* path);

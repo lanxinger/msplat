@@ -72,6 +72,21 @@ public class GaussianTrainer {
         }
     }
 
+    /// Render with a vertical field of view at a given resolution.
+    /// Useful for orbit rendering at display-native resolution without needing a reference camera.
+    /// `fovY` is in radians. Buffer must hold `width × height × 4` bytes.
+    /// Pass `nil` for `rgba` to query output dimensions only.
+    public func renderWithFovToBuffer(camToWorld: [Float], width: Int32, height: Int32,
+                                       fovY: Float, rgba: UnsafeMutablePointer<UInt8>?,
+                                       outWidth: inout Int32, outHeight: inout Int32) {
+        precondition(camToWorld.count == 16)
+        camToWorld.withUnsafeBufferPointer { ptr in
+            msplat_trainer_render_fov_to_buffer(handle, ptr.baseAddress!,
+                                                 width, height, fovY,
+                                                 rgba, &outWidth, &outHeight)
+        }
+    }
+
     /// Export scene as PLY.
     public func exportPly(to path: String) {
         msplat_trainer_export_ply(handle, path)
