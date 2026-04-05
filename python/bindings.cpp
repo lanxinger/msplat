@@ -159,8 +159,8 @@ public:
 
         model->fullIteration(cam, current_step, gt, config.ssim_weight, maskPtr);
         model->schedulersStep(current_step);
-        model->afterTrain(current_step);
         model->applyMaskOpacityPenalty(dataset_ptr->train_cams, current_step);
+        model->afterTrain(current_step);
         msplat_commit();
 
         auto t1 = std::chrono::high_resolution_clock::now();

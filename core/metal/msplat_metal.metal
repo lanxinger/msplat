@@ -907,6 +907,7 @@ kernel void rasterize_backward_kernel(
     constant float* final_Ts,
     constant int* final_index,
     constant float* v_output, // float3
+    constant float* v_alpha_img,
     device atomic_float* v_xy, // float2
     device atomic_float* v_conic, // float3
     device atomic_float* v_rgb, // float3
@@ -951,6 +952,7 @@ kernel void rasterize_backward_kernel(
 
     // df/d_out for this pixel
     const float3 v_out = read_packed_float3(v_output, pix_id);
+    const float v_alpha_pix = inside ? v_alpha_img[pix_id] : 0.f;
     // Hoist loop-invariant background load and T_final * bg product
     const float3 bg = {background[0], background[1], background[2]};
     const float3 T_final_bg = T_final * bg;
@@ -1059,6 +1061,7 @@ kernel void rasterize_backward_kernel(
                 const float3 rgb = max(b_rgb + 0.5f, 0.f);
                 // contribution from this pixel + background
                 v_alpha += dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out);
+                v_alpha += v_alpha_pix * T;
                 // update the running sum
                 buffer = fma(rgb, fac, buffer);
 
@@ -2928,6 +2931,7 @@ kernel void rasterize_backward_chunked_kernel(
     constant float* chunk_T_buf,    // [K_max, H, W]
     constant float* after_C_buf,    // [K_max, H, W, 3]
     constant float* v_output,
+    constant float* v_alpha_img,
     device atomic_float* v_xy,
     device atomic_float* v_conic,
     device atomic_float* v_rgb,
@@ -2969,6 +2973,7 @@ kernel void rasterize_backward_chunked_kernel(
     const float3 bg = {background[0], background[1], background[2]};
     const float3 T_final_bg = T_final * bg;
     const float3 v_out = read_packed_float3(v_output, pix_id);
+    const float v_alpha_pix = inside ? v_alpha_img[pix_id] : 0.f;
 
     const int bin_final = inside ? chunk_final_idx[chunk_offset] : -1;
 
@@ -3070,6 +3075,7 @@ kernel void rasterize_backward_chunked_kernel(
 
                 const float3 rgb = max(b_rgb + 0.5f, 0.f);
                 v_alpha += dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out);
+                v_alpha += v_alpha_pix * T;
                 buffer = fma(rgb, fac, buffer);
 
                 const float v_sigma = -alpha * v_alpha;
@@ -3302,6 +3308,7 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
     device float* deriv_h_buf, device atomic_float* loss_sum,
     constant float* mask [[buffer(8)]],
     constant int& has_mask [[buffer(9)]],
+    constant float* final_Ts [[buffer(10)]],
     uint2 gid [[thread_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]], uint2 tgid [[threadgroup_position_in_grid]],
     uint2 tg_size [[threads_per_threadgroup]]
@@ -3387,7 +3394,12 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
     }
 
     float pixel_loss = (px < W && py < H) ? ssim_weight*(1.0f-ssim_sum/3.0f) + (1.0f-ssim_weight)*l1_sum/3.0f : 0.0f;
-    if (has_mask && px < W && py < H) pixel_loss *= mask[py * W + px];
+    if (has_mask && px < W && py < H) {
+        float m = mask[py * W + px];
+        float bg_weight = (1.0f - m) * (1.0f - m);
+        float alpha = 1.0f - final_Ts[py * W + px];
+        pixel_loss = m * pixel_loss + bg_weight * alpha;
+    }
     threadgroup float tg_sum[256];
     tg_sum[tr] = pixel_loss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3488,9 +3500,9 @@ kernel void ssim_v_bwd_kernel(
     constant float& ssim_weight,
     constant float& inv_n,          // 1.0 / (H * W * 3)
     device float* v_rendered,       // (H, W, 3)
+    device float* v_alpha_img,      // (H, W)
     constant float* mask [[buffer(7)]],
     constant int& has_mask [[buffer(8)]],
-    constant float* background [[buffer(9)]],
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -3531,6 +3543,7 @@ kernel void ssim_v_bwd_kernel(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (px < W && py < H) {
+        float alpha_grad = 0.0f;
         for (uint c = 0; c < 3; c++) {
             float conv_f1 = 0, conv_f2 = 0, conv_f3 = 0;
             for (uint dy = 0; dy < SSIM_WIN; dy++) {
@@ -3553,16 +3566,16 @@ kernel void ssim_v_bwd_kernel(
             if (has_mask) {
                 float m = mask[py * W + px];
                 grad += inv_n * (1.0f - ssim_weight) * v_l1 * m;
-                // Background opacity penalty: push rendered values toward
-                // the configured background color in masked-out regions.
-                float bg_weight = (1.0f - m) * (1.0f - m);  // (1-mask)^2
-                float bg_val = background[c];
-                grad += inv_n * 0.5f * bg_weight * (rend_val - bg_val);
+                if (c == 0) {
+                    float bg_weight = (1.0f - m) * (1.0f - m);
+                    alpha_grad = 3.0f * inv_n * bg_weight;
+                }
             } else {
                 grad += inv_n * (1.0f - ssim_weight) * v_l1;
             }
             v_rendered[(py * W + px) * 3 + c] = grad;
         }
+        v_alpha_img[py * W + px] = alpha_grad;
     }
 }
 

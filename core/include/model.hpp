@@ -101,6 +101,7 @@ struct Model{
   int noiseStopAt;
   bool hybridRefine;
   int maxSplats;
+  bool maskAwareData = false;
 
   float scale;
   float translation[3] = {};

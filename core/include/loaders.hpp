@@ -19,6 +19,7 @@ Points readColmapPoints(const std::string &path);
 // Image I/O
 Image imreadRGB(const std::string &path, int maxDim = 0);  // maxDim>0: subsample decode
 Mask imreadMask(const std::string &path, int maxDim = 0);  // maxDim>0: subsample decode
+Mask imreadAlphaMask(const std::string &path, int maxDim = 0);  // empty if source has no useful alpha
 Image resizeArea(const Image &src, int dstW, int dstH);  // box-filter downscale
 Mask resizeAreaMask(const Mask &src, int dstW, int dstH);  // box-filter downscale (single channel)
 void imwriteRGB(const std::string &path, const Image &img);  // save as PNG

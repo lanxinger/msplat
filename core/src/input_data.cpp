@@ -78,10 +78,15 @@ void Camera::loadImage(float downscaleFactor, const std::string &maskDir) {
     Image raw = imreadRGB(filePath, thumbMaxDim);
     if (raw.empty()) return;
 
-    // Try loading a matching mask (with same subsample hint)
+    // Try loading a matching mask (with same subsample hint). If no explicit
+    // mask exists, fall back to the image alpha channel when present.
     std::string maskPath = findMaskPath(filePath, maskDir);
     Mask rawMask;
-    if (!maskPath.empty()) rawMask = imreadMask(maskPath, thumbMaxDim);
+    if (!maskPath.empty()) {
+        rawMask = imreadMask(maskPath, thumbMaxDim);
+    } else {
+        rawMask = imreadAlphaMask(filePath, thumbMaxDim);
+    }
 
     // Ensure mask matches image dimensions (resize if mismatched)
     if (!rawMask.empty() && (rawMask.width != raw.width || rawMask.height != raw.height))

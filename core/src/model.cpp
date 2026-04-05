@@ -134,6 +134,8 @@ Model::Model(const InputData &inputData, int numCameras,
     int64_t numPoints = inputData.points.count;
     scale = inputData.scale;
     memcpy(translation, inputData.translation, sizeof(translation));
+    maskAwareData = std::any_of(inputData.cameras.begin(), inputData.cameras.end(),
+                                [](const Camera& cam) { return cam.hasMask(); });
 
     // Means: copy xyz directly to GPU
     means = gpu_empty({numPoints, 3}, DType::Float32);
@@ -501,7 +503,7 @@ void Model::afterTrain(int step){
         // logit(0.2). Disabled in hybrid mode — Brush uses continuous decay
         // instead, and the reset conflicts with it by reviving background splats
         // that decay has been pushing toward zero.
-        if (!hybridRefine && step < stopSplitAt && step % resetInterval == refineEvery){
+        if (!hybridRefine && !maskAwareData && step < stopSplitAt && step % resetInterval == refineEvery){
             msplat_gpu_sync();
             constexpr float resetLogit = -1.3862943611198906f;
             float *op = opacities.data<float>();
@@ -652,7 +654,7 @@ void Model::afterTrain(int step){
 }
 
 void Model::applyMaskOpacityPenalty(std::vector<Camera>& cameras, int step) {
-    if (!hybridRefine || num_active <= 0) return;
+    if (!maskAwareData || num_active <= 0) return;
     // Only run every refineEvery steps during training
     if (step % refineEvery != 0 || step <= warmupLength) return;
 

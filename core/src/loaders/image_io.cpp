@@ -10,6 +10,74 @@
 #include <Accelerate/Accelerate.h>
 #include <dispatch/dispatch.h>
 
+namespace {
+
+struct DecodedRGBA8 {
+    std::vector<uint8_t> rgba;
+    int width = 0;
+    int height = 0;
+    bool hasAlpha = false;
+};
+
+static bool imageHasAlpha(CGImageAlphaInfo alphaInfo) {
+    switch (alphaInfo) {
+        case kCGImageAlphaNone:
+        case kCGImageAlphaNoneSkipFirst:
+        case kCGImageAlphaNoneSkipLast:
+            return false;
+        default:
+            return true;
+    }
+}
+
+static CGImageRef createImageAtScale(CGImageSourceRef source, int maxDim) {
+    if (maxDim > 0) {
+        CFMutableDictionaryRef opts = CFDictionaryCreateMutable(nullptr, 0,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        CFNumberRef maxDimRef = CFNumberCreate(nullptr, kCFNumberIntType, &maxDim);
+        CFDictionarySetValue(opts, kCGImageSourceThumbnailMaxPixelSize, maxDimRef);
+        CFDictionarySetValue(opts, kCGImageSourceCreateThumbnailFromImageAlways, kCFBooleanTrue);
+        CGImageRef image = CGImageSourceCreateThumbnailAtIndex(source, 0, opts);
+        CFRelease(maxDimRef);
+        CFRelease(opts);
+        return image;
+    }
+    return CGImageSourceCreateImageAtIndex(source, 0, nullptr);
+}
+
+static DecodedRGBA8 decodeRGBA8PreservingAlpha(const std::string &path, int maxDim) {
+    CFStringRef cfPath = CFStringCreateWithCString(nullptr, path.c_str(), kCFStringEncodingUTF8);
+    CFURLRef url = CFURLCreateWithFileSystemPath(nullptr, cfPath, kCFURLPOSIXPathStyle, false);
+    CFRelease(cfPath);
+
+    CGImageSourceRef source = CGImageSourceCreateWithURL(url, nullptr);
+    CFRelease(url);
+    if (!source) throw std::runtime_error("Failed to load image: " + path);
+
+    CGImageRef cgImage = createImageAtScale(source, maxDim);
+    CFRelease(source);
+    if (!cgImage) throw std::runtime_error("Failed to decode image: " + path);
+
+    DecodedRGBA8 out;
+    out.width = (int)CGImageGetWidth(cgImage);
+    out.height = (int)CGImageGetHeight(cgImage);
+    out.hasAlpha = imageHasAlpha(CGImageGetAlphaInfo(cgImage));
+    out.rgba.resize(out.width * out.height * 4);
+
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(
+        out.rgba.data(), out.width, out.height, 8, out.width * 4, colorSpace,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrderDefault
+    );
+    CGContextDrawImage(ctx, CGRectMake(0, 0, out.width, out.height), cgImage);
+    CGContextRelease(ctx);
+    CGColorSpaceRelease(colorSpace);
+    CGImageRelease(cgImage);
+    return out;
+}
+
+} // namespace
+
 // ── Image loading (CoreGraphics) ─────────────────────────────────────────────
 
 Image imreadRGB(const std::string &path, int maxDim) {
@@ -81,55 +149,30 @@ Image imreadRGB(const std::string &path, int maxDim) {
 // ── Mask loading (CoreGraphics, single-channel) ─────────────────────────────
 
 Mask imreadMask(const std::string &path, int maxDim) {
-    CFStringRef cfPath = CFStringCreateWithCString(nullptr, path.c_str(), kCFStringEncodingUTF8);
-    CFURLRef url = CFURLCreateWithFileSystemPath(nullptr, cfPath, kCFURLPOSIXPathStyle, false);
-    CFRelease(cfPath);
-
-    CGImageSourceRef source = CGImageSourceCreateWithURL(url, nullptr);
-    CFRelease(url);
-    if (!source) throw std::runtime_error("Failed to load mask: " + path);
-
-    CGImageRef cgImage = nullptr;
-    if (maxDim > 0) {
-        CFMutableDictionaryRef opts = CFDictionaryCreateMutable(nullptr, 0,
-            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-        CFNumberRef maxDimRef = CFNumberCreate(nullptr, kCFNumberIntType, &maxDim);
-        CFDictionarySetValue(opts, kCGImageSourceThumbnailMaxPixelSize, maxDimRef);
-        CFDictionarySetValue(opts, kCGImageSourceCreateThumbnailFromImageAlways, kCFBooleanTrue);
-        // Keep the stored pixel orientation so masks stay aligned with the cameras.
-        cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, opts);
-        CFRelease(maxDimRef);
-        CFRelease(opts);
-    } else {
-        cgImage = CGImageSourceCreateImageAtIndex(source, 0, nullptr);
-    }
-    CFRelease(source);
-    if (!cgImage) throw std::runtime_error("Failed to decode mask: " + path);
-
-    int w = (int)CGImageGetWidth(cgImage);
-    int h = (int)CGImageGetHeight(cgImage);
-
-    // Render into RGBA buffer
-    std::vector<uint8_t> rgba(w * h * 4);
-    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(
-        rgba.data(), w, h, 8, w * 4, colorSpace,
-        kCGImageAlphaNoneSkipLast | kCGBitmapByteOrderDefault
-    );
-    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cgImage);
-    CGContextRelease(ctx);
-    CGColorSpaceRelease(colorSpace);
-    CGImageRelease(cgImage);
-
-    // Convert to grayscale via luminance using Accelerate
+    DecodedRGBA8 decoded = decodeRGBA8PreservingAlpha(path, maxDim);
+    int w = decoded.width;
+    int h = decoded.height;
     int n = w * h;
     Mask m;
     m.width = w;
     m.height = h;
 
-    // Convert RGBA uint8 → float
+    if (decoded.hasAlpha) {
+        int alphaMin = 255;
+        for (int i = 0; i < n; i++) alphaMin = std::min(alphaMin, (int)decoded.rgba[i * 4 + 3]);
+        if (alphaMin < 255) {
+            m.data.resize(n);
+            std::vector<float> alphaPlane(n);
+            vDSP_vfltu8(&decoded.rgba[3], 4, alphaPlane.data(), 1, n);
+            float scale = 1.0f / 255.0f;
+            vDSP_vsmul(alphaPlane.data(), 1, &scale, m.data.data(), 1, n);
+            return m;
+        }
+    }
+
+    // Convert to grayscale via luminance using Accelerate
     std::vector<float> rgbaF(n * 4);
-    vDSP_vfltu8(rgba.data(), 1, rgbaF.data(), 1, n * 4);
+    vDSP_vfltu8(decoded.rgba.data(), 1, rgbaF.data(), 1, n * 4);
 
     // Extract R, G, B into separate planes and compute weighted sum
     std::vector<float> rPlane(n), gPlane(n), bPlane(n);
@@ -143,6 +186,27 @@ Mask imreadMask(const std::string &path, int maxDim) {
     vDSP_vsmul(rPlane.data(), 1, &wr, m.data.data(), 1, n);       // out = R*wr
     vDSP_vsma(gPlane.data(), 1, &wg, m.data.data(), 1, m.data.data(), 1, n); // out += G*wg
     vDSP_vsma(bPlane.data(), 1, &wb, m.data.data(), 1, m.data.data(), 1, n); // out += B*wb
+    return m;
+}
+
+Mask imreadAlphaMask(const std::string &path, int maxDim) {
+    DecodedRGBA8 decoded = decodeRGBA8PreservingAlpha(path, maxDim);
+    if (!decoded.hasAlpha) return {};
+
+    int n = decoded.width * decoded.height;
+    int alphaMin = 255;
+    for (int i = 0; i < n; i++) alphaMin = std::min(alphaMin, (int)decoded.rgba[i * 4 + 3]);
+    if (alphaMin >= 255) return {};
+
+    Mask m;
+    m.width = decoded.width;
+    m.height = decoded.height;
+    m.data.resize(n);
+
+    std::vector<float> alphaPlane(n);
+    vDSP_vfltu8(&decoded.rgba[3], 4, alphaPlane.data(), 1, n);
+    float scale = 1.0f / 255.0f;
+    vDSP_vsmul(alphaPlane.data(), 1, &scale, m.data.data(), 1, n);
     return m;
 }
 

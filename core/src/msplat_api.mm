@@ -182,8 +182,8 @@ Stats Trainer::step() {
 
     impl->model->fullIteration(cam, impl->currentStep, gt, impl->config.ssimWeight, maskPtr);
     impl->model->schedulersStep(impl->currentStep);
-    impl->model->afterTrain(impl->currentStep);
     impl->model->applyMaskOpacityPenalty(impl->ds->trainCams, impl->currentStep);
+    impl->model->afterTrain(impl->currentStep);
     msplat_commit();
 
     auto t1 = std::chrono::high_resolution_clock::now();
