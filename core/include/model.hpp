@@ -6,14 +6,15 @@
 #include "input_data.hpp"
 
 int numShBases(int degree);
-float psnr(const MTensor& rendered, const MTensor& gt);
-float l1_loss(const MTensor& rendered, const MTensor& gt);
+float psnr(const MTensor& rendered, const MTensor& gt, const MTensor* mask = nullptr);
+float l1_loss(const MTensor& rendered, const MTensor& gt, const MTensor* mask = nullptr);
 
 struct Model{
   Model(const InputData &inputData, int numCameras,
         int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
         int refineEvery, int warmupLength, int resetAlphaEvery, float densifyGradThresh, float densifySizeThresh, int stopScreenSizeAt, float splitScreenSize,
-        int maxSteps, bool keepCrs,
+        int maxSteps, bool keepCrs, float meanNoiseWeight, int noiseStopAt,
+        bool hybridRefine = false, int maxSplats = 0,
         const float* bgColor = nullptr);
 
   ~Model(){ releaseOptimizers(); }
@@ -24,6 +25,7 @@ struct Model{
   void schedulersStep(int step);
   int getDownscaleFactor(int step);
   void afterTrain(int step);
+  void applyMaskOpacityPenalty(std::vector<Camera>& cameras, int step);
   void save(const std::string &filename, int step);
   void savePly(const std::string &filename, int step);
   void saveSplat(const std::string &filename);
@@ -39,6 +41,7 @@ struct Model{
   CamSetup prepareCam(Camera& cam, int step);
   void fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight, MTensor *mask = nullptr);
   MTensor render(Camera& cam, int step);
+  void applyMeanNoise(int step);
 
   MTensor means;
   MTensor scales;
@@ -94,6 +97,10 @@ struct Model{
   float splitScreenSize;
   int maxSteps;
   bool keepCrs;
+  float meanNoiseWeight;
+  int noiseStopAt;
+  bool hybridRefine;
+  int maxSplats;
 
   float scale;
   float translation[3] = {};

@@ -88,8 +88,19 @@ int main(int argc, char *argv[]) {
     app.add_option("--split-screen-size", splitScreenSize, "Screen-space split threshold");
     bool keepCrs = false;
     app.add_flag("--keep-crs", keepCrs, "Retain input coordinate reference system");
+    float meanNoiseWeight = 50.0f;
+    app.add_option("--mean-noise-weight", meanNoiseWeight, "Brush-style mean noise weight during growth")
+        ->check(CLI::Range(0.0f, 1000000.0f));
+    int noiseStopAt = 15000;
+    app.add_option("--noise-stop-at", noiseStopAt, "Last training step that applies mean noise")
+        ->check(CLI::Range(0, 1000000));
+    bool hybridRefine = false;
+    app.add_flag("--hybrid-refine", hybridRefine, "Brush-style hybrid refine: replace dup growth with donor recycling");
+    int maxSplats = 0;
+    app.add_option("--max-splats", maxSplats, "Max splat count for hybrid refine (0 = no cap)")
+        ->check(CLI::Range(0, 100000000));
     std::vector<float> bgColor = {0.6130f, 0.0101f, 0.3984f};
-    app.add_option("--bg-color", bgColor, "Background RGB (0-1), default magenta")
+    auto *bgOpt = app.add_option("--bg-color", bgColor, "Background RGB (0-1), default magenta; auto-switches to black when masks detected")
         ->expected(3);
     std::string colmapImagePath;
     app.add_option("--colmap-image-path", colmapImagePath, "Override COLMAP image directory");
@@ -147,12 +158,18 @@ int main(int argc, char *argv[]) {
             cams = train; valCam = val;
         }
 
-        // Report mask detection
+        // Report mask detection; auto-switch to black background if masks
+        // present and user didn't explicitly set --bg-color (matches Brush).
         {
             int maskCount = 0;
             for (auto &c : cams) if (c.hasMask()) maskCount++;
-            if (maskCount > 0)
+            if (maskCount > 0) {
                 std::cout << "Masks: " << maskCount << "/" << cams.size() << " cameras" << std::endl;
+                if (bgOpt->count() == 0) {
+                    bgColor = {0.0f, 0.0f, 0.0f};
+                    std::cout << "Background: auto-switched to black (masked training)" << std::endl;
+                }
+            }
         }
 
         std::cout << "Initializing model (" << inputData.points.count << " points) ..." << std::flush;
@@ -160,7 +177,8 @@ int main(int argc, char *argv[]) {
                      numDownscales, resolutionSchedule, shDegree, shDegreeInterval,
                      refineEvery, warmupLength, resetAlphaEvery, densifyGradThresh,
                      densifySizeThresh, stopScreenSizeAt, splitScreenSize,
-                     numIters, keepCrs,
+                     numIters, keepCrs, meanNoiseWeight, noiseStopAt,
+                     hybridRefine, maxSplats,
                      bgColor.data());
         std::cout << " done" << std::endl;
 
@@ -194,6 +212,7 @@ int main(int argc, char *argv[]) {
             model.fullIteration(cam, step, gt, ssimWeight, maskPtr);
             model.schedulersStep(step);
             model.afterTrain(step);
+            model.applyMaskOpacityPenalty(cams, step);
             msplat_commit();
 
             if (step % progressInterval == 0 || step == (size_t)numIters) {
@@ -327,11 +346,18 @@ int main(int argc, char *argv[]) {
                 MTensor rgb = model.render(testCams[i], numIters);
                 msplat_gpu_sync();
                 MTensor rgb_cpu = rgb.cpu();
-                MTensor gt_cpu = testCams[i].getGPUImage(model.getDownscaleFactor(numIters)).cpu();
+                int dsf = model.getDownscaleFactor(numIters);
+                MTensor gt_cpu = testCams[i].getGPUImage(dsf).cpu();
+                MTensor mask_cpu;
+                MTensor *maskEval = nullptr;
+                if (testCams[i].hasMask()) {
+                    mask_cpu = testCams[i].getGPUMask(dsf).cpu();
+                    maskEval = &mask_cpu;
+                }
 
-                float p = psnr(rgb_cpu, gt_cpu);
-                float s = ssim_eval(rgb_cpu, gt_cpu);
-                float l = l1_loss(rgb_cpu, gt_cpu);
+                float p = psnr(rgb_cpu, gt_cpu, maskEval);
+                float s = ssim_eval(rgb_cpu, gt_cpu, 11, 1.5f, maskEval);
+                float l = l1_loss(rgb_cpu, gt_cpu, maskEval);
                 sumPsnr += p; sumSsim += s; sumL1 += l;
 
                 std::cout << "  [" << (i+1) << "/" << nTest << "] "
@@ -349,12 +375,19 @@ int main(int argc, char *argv[]) {
             MTensor rgb = model.render(*valCam, numIters);
             msplat_gpu_sync();
             MTensor rgb_cpu = rgb.cpu();
-            MTensor gt_cpu = valCam->getGPUImage(model.getDownscaleFactor(numIters)).cpu();
+            int dsf = model.getDownscaleFactor(numIters);
+            MTensor gt_cpu = valCam->getGPUImage(dsf).cpu();
+            MTensor mask_cpu;
+            MTensor *maskVal = nullptr;
+            if (valCam->hasMask()) {
+                mask_cpu = valCam->getGPUMask(dsf).cpu();
+                maskVal = &mask_cpu;
+            }
 
             std::cout << "\n=== Validation (" << valCam->filePath << ") ===" << std::endl;
-            std::cout << "  PSNR:  " << psnr(rgb_cpu, gt_cpu)
-                      << "  SSIM:  " << ssim_eval(rgb_cpu, gt_cpu)
-                      << "  L1:  " << l1_loss(rgb_cpu, gt_cpu)
+            std::cout << "  PSNR:  " << psnr(rgb_cpu, gt_cpu, maskVal)
+                      << "  SSIM:  " << ssim_eval(rgb_cpu, gt_cpu, 11, 1.5f, maskVal)
+                      << "  L1:  " << l1_loss(rgb_cpu, gt_cpu, maskVal)
                       << "  Gaussians: " << model.means.size(0) << std::endl;
         }
 

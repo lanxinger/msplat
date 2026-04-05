@@ -27,9 +27,13 @@ struct Config {
     float densifySizeThresh = 0.01f;
     int stopScreenSizeAt = 4000;
     float splitScreenSize = 0.05f;
+    float meanNoiseWeight = 50.0f;
+    int noiseStopAt = 15000;
+    bool hybridRefine = false;
+    int maxSplats = 0;
     bool keepCrs = false;
     float downscaleFactor = 1.0f;
-    float bgColor[3] = {0.6130f, 0.0101f, 0.3984f};  // magenta — high contrast for debugging
+    float bgColor[3] = {0.0f, 0.0f, 0.0f};  // black — matches Brush default for masked training
 };
 
 // ── Stats ───────────────────────────────────────────────────────────────────

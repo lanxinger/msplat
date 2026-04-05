@@ -153,6 +153,7 @@ struct MetalContext {
     id<MTLComputePipelineState> project_and_sh_backward_kernel_cpso;
     id<MTLComputePipelineState> fused_adam_kernel_cpso;
     id<MTLComputePipelineState> accumulate_grad_stats_kernel_cpso;
+    id<MTLComputePipelineState> apply_mean_noise_kernel_cpso;
     // GPU densification kernels
     id<MTLComputePipelineState> densify_classify_kernel_cpso;
     id<MTLComputePipelineState> densify_append_split_kernel_cpso;
@@ -160,6 +161,7 @@ struct MetalContext {
     id<MTLComputePipelineState> densify_cull_classify_kernel_cpso;
     id<MTLComputePipelineState> compact_scatter_kernel_cpso;
     id<MTLComputePipelineState> compact_copy_back_kernel_cpso;
+    id<MTLComputePipelineState> hybrid_refine_kernel_cpso;
 };
 
 // Explicit metallib path (set by Swift/Python wrappers before first use)
@@ -256,6 +258,7 @@ MetalContext* init_msplat_metal_context() {
     ctx->project_and_sh_backward_kernel_cpso      = load(@"project_and_sh_backward_kernel");
     ctx->fused_adam_kernel_cpso                    = load(@"fused_adam_kernel");
     ctx->accumulate_grad_stats_kernel_cpso        = load(@"accumulate_grad_stats_kernel");
+    ctx->apply_mean_noise_kernel_cpso             = load(@"apply_mean_noise_kernel");
     // GPU densification
     ctx->densify_classify_kernel_cpso             = load(@"densify_classify_kernel");
     ctx->densify_append_split_kernel_cpso         = load(@"densify_append_split_kernel");
@@ -263,6 +266,7 @@ MetalContext* init_msplat_metal_context() {
     ctx->densify_cull_classify_kernel_cpso        = load(@"densify_cull_classify_kernel");
     ctx->compact_scatter_kernel_cpso              = load(@"compact_scatter_kernel");
     ctx->compact_copy_back_kernel_cpso            = load(@"compact_copy_back_kernel");
+    ctx->hybrid_refine_kernel_cpso                = load(@"hybrid_refine_kernel");
 
     [metal_library release];
 
@@ -771,6 +775,15 @@ MTensor msplat_render(
     return g_tcache.out_img;
 }
 
+// Read per-pixel alpha (1 - T) from the most recent render.
+// Must be called after msplat_render and before the next render.
+void msplat_get_render_alpha(float* out, int n) {
+    MetalContext* ctx = get_global_context();
+    ctx->syncCB();
+    const float *t = g_tcache.final_Ts.data<float>();
+    for (int i = 0; i < n; i++) out[i] = 1.0f - t[i];
+}
+
 std::tuple<MTensor, float> msplat_train_step(
     int num_points, MTensor &means3d, MTensor &scales, float glob_scale,
     MTensor &quats, MTensor &viewmat, MTensor &projmat,
@@ -1034,6 +1047,7 @@ std::tuple<MTensor, float> msplat_train_step(
         ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
         ENC_BUF(enc, v_rendered, 6);
         ENC_BUF(enc, mask_buf, 7); ENC_SCALAR(enc, has_mask_val, 8);
+        ENC_BUF(enc, background, 9);
         [enc dispatchThreads:grid threadsPerThreadgroup:tg];
     };
 
@@ -1360,7 +1374,8 @@ int msplat_densify(
     MTensor &split_prefix, MTensor &dup_prefix,
     MTensor &keep_flag, MTensor &keep_prefix,
     MTensor &block_totals, MTensor &compact_scratch,
-    MTensor &random_samples
+    MTensor &random_samples,
+    int skip_dup
 ) {
     MetalContext* ctx = get_global_context();
 
@@ -1417,6 +1432,8 @@ int msplat_densify(
             ENC_SCALAR(enc, check_screen_int, 9);
             ENC_BUF(enc, split_flag, 10);
             ENC_BUF(enc, dup_flag, 11);
+            int skip_dup_int = skip_dup;
+            ENC_SCALAR(enc, skip_dup_int, 12);
             [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -1601,4 +1618,96 @@ int msplat_densify(
     ctx->syncCB();
     int new_count = keep_prefix.data<int32_t>()[worst_case - 1];
     return new_count;
+}
+
+void msplat_apply_mean_noise(
+    int N,
+    float mean_noise_weight,
+    float lr_mean,
+    MTensor &means,
+    MTensor &scales,
+    MTensor &quats,
+    MTensor &opacities,
+    MTensor &radii,
+    uint32_t step_seed
+) {
+    if (N <= 0 || mean_noise_weight <= 0.0f || lr_mean <= 0.0f) return;
+
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    assert(command_buffer && "Failed to retrieve command buffer reference");
+
+    uint32_t N_u32 = (uint32_t)N;
+
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        assert(enc && "Failed to create compute command encoder");
+
+        NSUInteger tpg = MIN(ctx->apply_mean_noise_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)N);
+        [enc setComputePipelineState:ctx->apply_mean_noise_kernel_cpso];
+        ENC_SCALAR(enc, N_u32, 0);
+        ENC_SCALAR(enc, mean_noise_weight, 1);
+        ENC_SCALAR(enc, lr_mean, 2);
+        ENC_BUF(enc, means, 3);
+        ENC_BUF(enc, scales, 4);
+        ENC_BUF(enc, quats, 5);
+        ENC_BUF(enc, opacities, 6);
+        ENC_BUF(enc, radii, 7);
+        ENC_SCALAR(enc, step_seed, 8);
+        [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+
+        [enc endEncoding];
+    });
+}
+
+void msplat_hybrid_refine(
+    int num_active, int budget, int fr_stride,
+    MTensor &donor_indices, MTensor &random_samples,
+    MTensor &means_buf, MTensor &scales_buf, MTensor &quats_buf,
+    MTensor &featuresDc_buf, MTensor &featuresRest_buf, MTensor &opacities_buf,
+    MTensor adam_exp_avg_buf[], MTensor adam_exp_avg_sq_buf[]
+) {
+    if (budget <= 0) return;
+
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    assert(command_buffer && "Failed to retrieve command buffer reference");
+
+    uint32_t na = (uint32_t)num_active;
+    uint32_t bu = (uint32_t)budget;
+    int fr_stride_val = fr_stride;
+
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        assert(enc && "Failed to create compute command encoder");
+
+        NSUInteger tpg = MIN(ctx->hybrid_refine_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)budget);
+        [enc setComputePipelineState:ctx->hybrid_refine_kernel_cpso];
+        ENC_SCALAR(enc, na, 0);
+        ENC_SCALAR(enc, bu, 1);
+        ENC_BUF(enc, donor_indices, 2);
+        ENC_BUF(enc, random_samples, 3);
+        ENC_BUF(enc, means_buf, 4);
+        ENC_BUF(enc, scales_buf, 5);
+        ENC_BUF(enc, quats_buf, 6);
+        ENC_BUF(enc, featuresDc_buf, 7);
+        ENC_BUF(enc, featuresRest_buf, 8);
+        ENC_BUF(enc, opacities_buf, 9);
+        ENC_SCALAR(enc, fr_stride_val, 10);
+        ENC_BUF(enc, adam_exp_avg_buf[0], 11);
+        ENC_BUF(enc, adam_exp_avg_buf[1], 12);
+        ENC_BUF(enc, adam_exp_avg_buf[2], 13);
+        ENC_BUF(enc, adam_exp_avg_buf[3], 14);
+        ENC_BUF(enc, adam_exp_avg_buf[4], 15);
+        ENC_BUF(enc, adam_exp_avg_buf[5], 16);
+        ENC_BUF(enc, adam_exp_avg_sq_buf[0], 17);
+        ENC_BUF(enc, adam_exp_avg_sq_buf[1], 18);
+        ENC_BUF(enc, adam_exp_avg_sq_buf[2], 19);
+        ENC_BUF(enc, adam_exp_avg_sq_buf[3], 20);
+        ENC_BUF(enc, adam_exp_avg_sq_buf[4], 21);
+        ENC_BUF(enc, adam_exp_avg_sq_buf[5], 22);
+        [enc dispatchThreads:MTLSizeMake(budget, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+
+        [enc endEncoding];
+    });
 }

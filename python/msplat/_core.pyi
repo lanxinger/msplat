@@ -17,12 +17,16 @@ class TrainingConfig:
     densify_size_thresh: float
     stop_screen_size_at: int
     split_screen_size: float
+    mean_noise_weight: float
+    noise_stop_at: int
+    hybrid_refine: bool
+    max_splats: int
     keep_crs: bool
     downscale_factor: float
     output: str
     save_every: int
     bg_color: list[float]
-    """Background color as [R, G, B] floats in [0, 1]. Default magenta [0.613, 0.010, 0.398]."""
+    """Background color as [R, G, B] floats in [0, 1]. Default black [0, 0, 0]."""
 
     def __init__(
         self,
@@ -44,6 +48,10 @@ class TrainingConfig:
         output: str = "splat.ply",
         save_every: int = -1,
         bg_color: list[float] = ...,
+        mean_noise_weight: float = 50.0,
+        noise_stop_at: int = 15000,
+        hybrid_refine: bool = False,
+        max_splats: int = 0,
     ) -> None: ...
 
 class TrainingStats:

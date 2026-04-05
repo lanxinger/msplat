@@ -27,6 +27,10 @@ typedef struct {
     float densifySizeThresh;
     int stopScreenSizeAt;
     float splitScreenSize;
+    float meanNoiseWeight;
+    int noiseStopAt;
+    bool hybridRefine;
+    int maxSplats;
     bool keepCrs;
     float downscaleFactor;
     float bgColor[3];
@@ -47,9 +51,13 @@ static inline MsplatConfig msplat_default_config(void) {
     c.densifySizeThresh = 0.01f;
     c.stopScreenSizeAt = 4000;
     c.splitScreenSize = 0.05f;
+    c.meanNoiseWeight = 50.0f;
+    c.noiseStopAt = 15000;
+    c.hybridRefine = false;
+    c.maxSplats = 0;
     c.keepCrs = false;
     c.downscaleFactor = 1.0f;
-    c.bgColor[0] = 0.6130f; c.bgColor[1] = 0.0101f; c.bgColor[2] = 0.3984f;
+    c.bgColor[0] = 0.0f; c.bgColor[1] = 0.0f; c.bgColor[2] = 0.0f;
     return c;
 }
 

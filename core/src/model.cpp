@@ -1,6 +1,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <numeric>
 #include <random>
 #include "model.hpp"
 #include "kdtree_tensor.hpp"
@@ -8,6 +9,65 @@
 #include "loaders.hpp"
 
 namespace fs = std::filesystem;
+
+// Fenwick (binary indexed) tree for O(log N) weighted sampling without
+// replacement.  Supports: build from weights, sample one index from the
+// cumulative distribution, zero the chosen weight — all in O(log N).
+struct FenwickSampler {
+    std::vector<double> tree; // 1-indexed prefix sums
+    int n;
+
+    void build(const double* w, int len) {
+        n = len;
+        tree.assign(n + 1, 0.0);
+        for (int i = 0; i < n; i++) tree[i + 1] = w[i];
+        for (int i = 1; i <= n; i++) {
+            int j = i + (i & -i);
+            if (j <= n) tree[j] += tree[i];
+        }
+    }
+
+    double total() const {
+        double s = 0;
+        for (int i = n; i > 0; i -= i & -i) s += tree[i];
+        return s;
+    }
+
+    // Find smallest index whose prefix sum >= target. O(log N).
+    int sample(double target) const {
+        int pos = 0;
+        for (int bit = 1 << (31 - __builtin_clz(n)); bit; bit >>= 1) {
+            int next = pos + bit;
+            if (next <= n && tree[next] < target) {
+                target -= tree[next];
+                pos = next;
+            }
+        }
+        return std::min(pos, n - 1); // 0-indexed result
+    }
+
+    // Subtract delta from element at 0-indexed position idx.
+    void update(int idx, double delta) {
+        for (int i = idx + 1; i <= n; i += i & -i) tree[i] -= delta;
+    }
+
+    // Sample and remove: returns 0-indexed donor, zeroes its weight.
+    int draw(double u) {
+        int idx = sample(u);
+        // Read the element weight = prefix(idx+1) - prefix(idx)
+        double w = weight_at(idx);
+        update(idx, w);
+        return idx;
+    }
+
+    double weight_at(int idx) const {
+        double s = tree[idx + 1];
+        int z = idx + 1 - ((idx + 1) & -(idx + 1));
+        for (int i = idx; i > z; i -= i & -i) s -= tree[i];
+        return s;
+    }
+};
+
 
 static const double C0 = 0.28209479177387814;
 
@@ -22,35 +82,54 @@ int numShBases(int degree){
 }
 
 // Metrics on CPU MTensor data
-float psnr(const MTensor& rendered, const MTensor& gt) {
-    int64_t n = rendered.numel();
+float psnr(const MTensor& rendered, const MTensor& gt, const MTensor* mask) {
+    int64_t pixels = rendered.numel() / 3;
     const float *r = rendered.data<float>(), *g = gt.data<float>();
-    double mse = 0;
-    for (int64_t i = 0; i < n; i++) { double d = r[i] - g[i]; mse += d * d; }
-    mse /= n;
-    return 10.0f * std::log10(1.0 / mse);
+    const float *m = mask ? mask->data<float>() : nullptr;
+    double wse = 0, wsum = 0;
+    for (int64_t p = 0; p < pixels; p++) {
+        float w = m ? m[p] : 1.0f;
+        if (w <= 0.0f) continue;
+        for (int c = 0; c < 3; c++) {
+            double d = r[p*3+c] - g[p*3+c];
+            wse += w * d * d;
+        }
+        wsum += w * 3.0;
+    }
+    if (wsum <= 0.0) return 0.0f;
+    return 10.0f * std::log10(1.0 / (wse / wsum));
 }
 
-float l1_loss(const MTensor& rendered, const MTensor& gt) {
-    int64_t n = rendered.numel();
+float l1_loss(const MTensor& rendered, const MTensor& gt, const MTensor* mask) {
+    int64_t pixels = rendered.numel() / 3;
     const float *r = rendered.data<float>(), *g = gt.data<float>();
-    double sum = 0;
-    for (int64_t i = 0; i < n; i++) sum += std::abs(r[i] - g[i]);
-    return (float)(sum / n);
+    const float *m = mask ? mask->data<float>() : nullptr;
+    double wsum_err = 0, wsum = 0;
+    for (int64_t p = 0; p < pixels; p++) {
+        float w = m ? m[p] : 1.0f;
+        if (w <= 0.0f) continue;
+        for (int c = 0; c < 3; c++)
+            wsum_err += w * std::abs(r[p*3+c] - g[p*3+c]);
+        wsum += w * 3.0;
+    }
+    if (wsum <= 0.0) return 0.0f;
+    return (float)(wsum_err / wsum);
 }
 
 // Model constructor
 Model::Model(const InputData &inputData, int numCameras,
     int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
     int refineEvery, int warmupLength, int resetAlphaEvery, float densifyGradThresh, float densifySizeThresh, int stopScreenSizeAt, float splitScreenSize,
-    int maxSteps, bool keepCrs,
+    int maxSteps, bool keepCrs, float meanNoiseWeight, int noiseStopAt,
+    bool hybridRefine, int maxSplats,
     const float* bgColor)
     : numCameras(numCameras), numDownscales(numDownscales), resolutionSchedule(resolutionSchedule),
       shDegree(shDegree), shDegreeInterval(shDegreeInterval),
       refineEvery(refineEvery), warmupLength(warmupLength), resetAlphaEvery(resetAlphaEvery),
       stopSplitAt(maxSteps / 2), densifyGradThresh(densifyGradThresh), densifySizeThresh(densifySizeThresh),
       stopScreenSizeAt(stopScreenSizeAt), splitScreenSize(splitScreenSize),
-      maxSteps(maxSteps), keepCrs(keepCrs) {
+      maxSteps(maxSteps), keepCrs(keepCrs), meanNoiseWeight(meanNoiseWeight), noiseStopAt(noiseStopAt),
+      hybridRefine(hybridRefine), maxSplats(maxSplats) {
 
     int64_t numPoints = inputData.points.count;
     scale = inputData.scale;
@@ -111,7 +190,7 @@ Model::Model(const InputData &inputData, int numCameras,
     // Background color — default is magenta (high-contrast against typical scenes,
     // makes under-reconstructed regions obvious during training)
     backgroundColor = gpu_empty({3}, DType::Float32);
-    static const float defaultBg[3] = {0.6130f, 0.0101f, 0.3984f};
+    static const float defaultBg[3] = {0.0f, 0.0f, 0.0f};
     memcpy(backgroundColor.data_ptr(), bgColor ? bgColor : defaultBg, 3 * sizeof(float));
     setupOptimizers();
 }
@@ -224,6 +303,7 @@ void Model::ensureCapacity(int needed){
     densify_compact_scratch = gpu_zeros({(int64_t)new_cap * fr_stride}, DType::Float32);
     densify_random_samples = gpu_zeros({new_cap, 3}, DType::Float32);
 
+
     buf_capacity = new_cap;
     refreshViews();
 }
@@ -257,10 +337,33 @@ void Model::afterTrain(int step){
             bool checkHuge = step > refineEvery * resetAlphaEvery;
             int fr_stride = (int)featuresRest_buf.stride0();
 
+            // In hybrid mode, save pre-compact stats BEFORE densify:
+            // 1. Count above-threshold splats (for adaptive growth budget)
+            // 2. Save visCounts + gradient norms (for two-CDF donor sampling)
+            int aboveThreshCount = 0;
+            std::vector<float> savedVisCounts;
+            std::vector<float> savedGradWeights;  // per-splat avg gradient norm
+            if (hybridRefine && xysGradNorm.defined() && visCounts.defined()) {
+                msplat_gpu_sync();
+                const float *gn = xysGradNorm.data<float>();
+                const float *vc = visCounts.data<float>();
+                savedVisCounts.assign(vc, vc + num_active);
+                savedGradWeights.resize(num_active);
+                for (int i = 0; i < num_active; i++) {
+                    float avg_grad = (vc[i] > 0) ? (gn[i] / vc[i]) * half_max_dim : 0.0f;
+                    savedGradWeights[i] = avg_grad;
+                    if (avg_grad > densifyGradThresh)
+                        aboveThreshCount++;
+                }
+            }
+
+            // Brush prune threshold: opacity < 1/255 (vs classic 3DGS's 0.1)
+            float cullAlpha = hybridRefine ? (1.0f / 255.0f) : 0.1f;
+
             int new_count = msplat_densify(
                 num_active, buf_capacity,
                 densifyGradThresh, densifySizeThresh, splitScreenSize, check_screen,
-                0.1f, 0.5f, 0.15f, checkHuge ? 1 : 0,
+                cullAlpha, 0.5f, 0.15f, checkHuge ? 1 : 0,
                 xysGradNorm, visCounts, max2DSize, half_max_dim,
                 means_buf, scales_buf, quats_buf,
                 featuresDc_buf, featuresRest_buf, opacities_buf, fr_stride,
@@ -269,15 +372,136 @@ void Model::afterTrain(int step){
                 densify_split_prefix, densify_dup_prefix,
                 densify_keep_flag, densify_keep_prefix,
                 densify_block_totals, densify_compact_scratch,
-                densify_random_samples
+                densify_random_samples,
+                hybridRefine ? 1 : 0
             );
 
             num_active = new_count;
             refreshViews();
-            std::cout << "Densified: " << numPointsBefore << " -> " << num_active << " gaussians" << std::endl;
+
+            // ── Hybrid refine: recycle pruned budget + adaptive growth ──
+            // Matches Brush's two-channel approach:
+            //   1. Recycling: replace pruned slots with opacity-weighted donors
+            //   2. Growth: add 20% of above-gradient-threshold splats (adaptive)
+            // CDF build + WOR sampling on CPU; clone + parent update on GPU.
+            if (hybridRefine && num_active > 0) {
+                int freed = std::max(0, numPointsBefore - num_active);
+                // Growth: gradient-adaptive count, with a floor of 5% of population
+                // to match Brush's growth rate (~10K/step from 200K base).
+                static constexpr float GROWTH_SELECT_FRACTION = 0.2f;
+                int grad_growth = (int)(aboveThreshCount * GROWTH_SELECT_FRACTION + 0.5f);
+                int min_growth = num_active / 33;  // ~3% floor — reaches ~400K by stopSplitAt from 188K
+                int growth = std::max(grad_growth, min_growth);
+                int budget = freed + growth;
+                if (maxSplats > 0)
+                    budget = std::min(budget, std::max(0, maxSplats - num_active));
+                budget = std::min(budget, num_active);
+
+                if (budget > 0) {
+                    // Reconstruct compacted visibility + gradient weights BEFORE
+                    // ensureCapacity (which can reallocate keep_flag/keep_prefix).
+                    int worst_case = 3 * numPointsBefore;
+                    const int32_t *kf = densify_keep_flag.data<int32_t>();
+                    const int32_t *kp = densify_keep_prefix.data<int32_t>();
+                    std::vector<float> compactVis(num_active, 0.0f);
+                    std::vector<float> compactGrad(num_active, 0.0f);
+                    if (!savedVisCounts.empty()) {
+                        int N_old = numPointsBefore;
+                        for (int i = 0; i < worst_case && i < buf_capacity; i++) {
+                            if (kf[i] == 0) continue;
+                            int dst_idx = kp[i] - 1;
+                            if (dst_idx < 0 || dst_idx >= num_active) continue;
+                            if (i < N_old) {
+                                compactVis[dst_idx] = savedVisCounts[i];
+                                compactGrad[dst_idx] = savedGradWeights[i];
+                            }
+                        }
+                        // Propagate parent stats to split children so they
+                        // participate in the hybrid donor CDF.
+                        const int32_t *sf = densify_split_flag.data<int32_t>();
+                        const int32_t *sp = densify_split_prefix.data<int32_t>();
+                        for (int i = 0; i < N_old; i++) {
+                            if (sf[i] == 0) continue;
+                            int ord = sp[i] - 1;
+                            for (int k = 0; k < 2; k++) {
+                                int child = N_old + 2 * ord + k;
+                                if (child >= worst_case || child >= buf_capacity) continue;
+                                if (kf[child] == 0) continue;
+                                int dst_idx = kp[child] - 1;
+                                if (dst_idx >= 0 && dst_idx < num_active) {
+                                    compactVis[dst_idx] = savedVisCounts[i];
+                                    compactGrad[dst_idx] = savedGradWeights[i];
+                                }
+                            }
+                        }
+                    }
+
+                    ensureCapacity(num_active + budget);
+                    fr_stride = (int)featuresRest_buf.stride0();
+                    float *op = opacities_buf.data<float>();
+
+                    // Weighted sampling without replacement (hybrid densify).
+                    // Weights: sigmoid(opacity) * vis_mask (Brush-style).
+                    // Uses Fenwick tree for O(budget * log N) instead of O(budget * N).
+                    std::vector<double> weights(num_active);
+                    for (int i = 0; i < num_active; i++) {
+                        double sig = 1.0 / (1.0 + std::exp(-(double)op[i]));
+                        double vis = (compactVis[i] > 0) ? 1.0 : 0.0;
+                        weights[i] = sig * vis;
+                    }
+                    FenwickSampler sampler;
+                    sampler.build(weights.data(), num_active);
+
+                    std::vector<int32_t> donorIndices(budget);
+                    std::vector<float> rndSamples(budget * 3);
+                    int recycled = 0;
+
+                    double running = sampler.total();
+                    if (running > 0) {
+                        std::mt19937 rng(step ^ 0xDEADBEEFu);
+                        std::uniform_real_distribution<double> uni(0.0, 1.0);
+                        std::normal_distribution<float> randn(0.0f, 1.0f);
+
+                        for (int d = 0; d < budget; d++) {
+                            running = sampler.total();
+                            if (running <= 0) break;
+                            int c = sampler.draw(uni(rng) * running);
+                            donorIndices[recycled] = c;
+                            rndSamples[recycled*3]   = randn(rng);
+                            rndSamples[recycled*3+1] = randn(rng);
+                            rndSamples[recycled*3+2] = randn(rng);
+                            recycled++;
+                        }
+                    }
+
+                    if (recycled > 0) {
+                        MTensor donorBuf = gpu_empty({(int64_t)recycled}, DType::Int32);
+                        memcpy(donorBuf.data_ptr(), donorIndices.data(), recycled * sizeof(int32_t));
+                        memcpy(densify_random_samples.data_ptr(), rndSamples.data(), recycled * 3 * sizeof(float));
+
+                        msplat_hybrid_refine(
+                            num_active, recycled, fr_stride,
+                            donorBuf, densify_random_samples,
+                            means_buf, scales_buf, quats_buf,
+                            featuresDc_buf, featuresRest_buf, opacities_buf,
+                            adam_exp_avg_buf, adam_exp_avg_sq_buf
+                        );
+                    }
+
+                    num_active += recycled;
+                    refreshViews();
+                }
+            }
+
+            std::cout << "Densified: " << numPointsBefore << " -> " << num_active << " gaussians"
+                      << (hybridRefine ? " (hybrid)" : "") << std::endl;
         }
 
-        if (step < stopSplitAt && step % resetInterval == refineEvery){
+        // Opacity reset: classic 3DGS mechanism that clamps all opacities to
+        // logit(0.2). Disabled in hybrid mode — Brush uses continuous decay
+        // instead, and the reset conflicts with it by reviving background splats
+        // that decay has been pushing toward zero.
+        if (!hybridRefine && step < stopSplitAt && step % resetInterval == refineEvery){
             msplat_gpu_sync();
             constexpr float resetLogit = -1.3862943611198906f;
             float *op = opacities.data<float>();
@@ -293,6 +517,240 @@ void Model::afterTrain(int step){
         visCounts.reset();
         max2DSize.reset();
     }
+
+    // ── Brush-style opacity/scale decay + continuous prune + recycle ──
+    // Runs every refineEvery steps (matching LichtFeld/Brush cadence).
+    // The decay constants (0.004 opacity, 0.002 scale) are calibrated
+    // for per-refine-step application, not per-training-step.
+    // "ALWAYS" means this runs even after stopSplitAt — keeping the
+    // population stable via decay→prune→recycle after growth ends.
+    if (hybridRefine && step > warmupLength && step % refineEvery == 0) {
+        msplat_gpu_sync();
+        static constexpr float OPAC_DECAY = 0.004f;
+        static constexpr float SCALE_DECAY = 0.002f;
+        static constexpr float MIN_OPACITY = 1.0f / 255.0f;
+        float train_t = std::clamp((float)step / (float)maxSteps, 0.0f, 1.0f);
+        float shrink_strength = 1.0f - train_t;
+        float minus_opac = OPAC_DECAY * shrink_strength;
+        float scale_factor = 1.0f - SCALE_DECAY * shrink_strength;
+
+        float *op = opacities.data<float>();
+        float *sc = scales.data<float>();
+        int n = num_active;
+
+        // Apply decay
+        if (minus_opac > 0 || scale_factor < 1.0f) {
+            float log_sf = std::log(scale_factor);
+            for (int i = 0; i < n; i++) {
+                float sig = 1.0f / (1.0f + std::exp(-op[i]));
+                float new_sig = std::clamp(sig - minus_opac, 1e-6f, 1.0f - 1e-6f);
+                op[i] = std::log(new_sig / (1.0f - new_sig));
+                sc[i*3] += log_sf; sc[i*3+1] += log_sf; sc[i*3+2] += log_sf;
+            }
+        }
+
+        // Continuous pruning: compact in-place
+        int pre_prune = num_active;
+        int dst = 0;
+        float *mn = means.data<float>();
+        float *qt = quats.data<float>();
+        float *dc = featuresDc.data<float>();
+        float *fr = featuresRest.data<float>();
+        int fr_stride = (int)featuresRest_buf.stride0();
+        int strides[6] = {3, 3, 4, 3, fr_stride, 1};
+        float *param_ptrs[6] = {mn, sc, qt, dc, fr, op};
+        float *adam_ea_ptrs[6], *adam_es_ptrs[6];
+        for (int g = 0; g < N_ADAM_GROUPS; g++) {
+            adam_ea_ptrs[g] = adam_exp_avg[g].data<float>();
+            adam_es_ptrs[g] = adam_exp_avg_sq[g].data<float>();
+        }
+
+        for (int i = 0; i < n; i++) {
+            float sig = 1.0f / (1.0f + std::exp(-op[i]));
+            float s0 = std::exp(sc[i*3]), s1 = std::exp(sc[i*3+1]), s2 = std::exp(sc[i*3+2]);
+            float max_s = std::max({s0, s1, s2});
+            float min_s = std::min({s0, s1, s2});
+
+            bool dead = sig < MIN_OPACITY || min_s < 1e-10f || max_s > scale * 100.0f;
+            if (dead) continue;
+
+            if (dst != i) {
+                for (int g = 0; g < N_ADAM_GROUPS; g++) {
+                    memmove(&param_ptrs[g][dst * strides[g]], &param_ptrs[g][i * strides[g]], strides[g] * sizeof(float));
+                    memmove(&adam_ea_ptrs[g][dst * strides[g]], &adam_ea_ptrs[g][i * strides[g]], strides[g] * sizeof(float));
+                    memmove(&adam_es_ptrs[g][dst * strides[g]], &adam_es_ptrs[g][i * strides[g]], strides[g] * sizeof(float));
+                }
+            }
+            dst++;
+        }
+
+        if (dst < num_active) {
+            num_active = dst;
+            refreshViews();
+        }
+
+        // Recycle pruned budget via opacity-weighted donor sampling.
+        // This runs ALWAYS (not just during densification), matching Brush.
+        int pruned = pre_prune - num_active;
+        if (pruned > 0 && num_active > 0) {
+            int budget = std::min(pruned, num_active);
+            if (maxSplats > 0)
+                budget = std::min(budget, std::max(0, maxSplats - num_active));
+
+            if (budget > 0) {
+                ensureCapacity(num_active + budget);
+                fr_stride = (int)featuresRest_buf.stride0();
+                op = opacities_buf.data<float>();
+
+                // Weighted sampling without replacement (continuous-prune recycle).
+                // Uses Fenwick tree for O(budget * log N) instead of O(budget * N).
+                std::vector<double> weights(num_active);
+                for (int i = 0; i < num_active; i++) {
+                    double sig = 1.0 / (1.0 + std::exp(-(double)op[i]));
+                    weights[i] = sig;
+                }
+                FenwickSampler sampler;
+                sampler.build(weights.data(), num_active);
+                double running = sampler.total();
+                if (running > 0) {
+                    std::mt19937 rng(step ^ 0xABCD1234u);
+                    std::uniform_real_distribution<double> uni(0.0, 1.0);
+                    std::normal_distribution<float> randn(0.0f, 1.0f);
+                    std::vector<int32_t> donorIdx(budget);
+                    std::vector<float> rndBuf(budget * 3);
+                    int recycled = 0;
+
+                    for (int d = 0; d < budget; d++) {
+                        running = sampler.total();
+                        if (running <= 0) break;
+                        int c = sampler.draw(uni(rng) * running);
+                        donorIdx[recycled] = c;
+                        rndBuf[recycled*3]   = randn(rng);
+                        rndBuf[recycled*3+1] = randn(rng);
+                        rndBuf[recycled*3+2] = randn(rng);
+                        recycled++;
+                    }
+
+                    if (recycled > 0) {
+                        MTensor donorBuf = gpu_empty({(int64_t)recycled}, DType::Int32);
+                        memcpy(donorBuf.data_ptr(), donorIdx.data(), recycled * sizeof(int32_t));
+                        memcpy(densify_random_samples.data_ptr(), rndBuf.data(), recycled * 3 * sizeof(float));
+                        msplat_hybrid_refine(
+                            num_active, recycled, fr_stride,
+                            donorBuf, densify_random_samples,
+                            means_buf, scales_buf, quats_buf,
+                            featuresDc_buf, featuresRest_buf, opacities_buf,
+                            adam_exp_avg_buf, adam_exp_avg_sq_buf
+                        );
+                        num_active += recycled;
+                        refreshViews();
+                    }
+                }
+            }
+        }
+    }
+}
+
+void Model::applyMaskOpacityPenalty(std::vector<Camera>& cameras, int step) {
+    if (!hybridRefine || num_active <= 0) return;
+    // Only run every refineEvery steps during training
+    if (step % refineEvery != 0 || step <= warmupLength) return;
+
+    msplat_gpu_sync();
+
+    // LichtFeld-style: penalize opacity for splats whose centers project
+    // into background (masked) regions. Sample a subset of cameras.
+    static constexpr float PENALTY_WEIGHT = 0.02f;  // opacity reduction per step
+    static constexpr int MAX_SAMPLE_CAMS = 8;
+
+    std::mt19937 rng(step ^ 0x55AA55AAu);
+    int nCams = (int)cameras.size();
+    int nSample = std::min(nCams, MAX_SAMPLE_CAMS);
+
+    // Pick random camera indices
+    std::vector<int> camIdx(nCams);
+    std::iota(camIdx.begin(), camIdx.end(), 0);
+    std::shuffle(camIdx.begin(), camIdx.end(), rng);
+    camIdx.resize(nSample);
+
+    float *op = opacities.data<float>();
+    const float *mn = means.data<float>();
+
+    for (int i = 0; i < num_active; i++) {
+        float px = mn[i*3], py = mn[i*3+1], pz = mn[i*3+2];
+        float bg_sum = 0;
+        int valid = 0;
+
+        for (int ci = 0; ci < nSample; ci++) {
+            Camera &cam = cameras[camIdx[ci]];
+            int dsf = getDownscaleFactor(step);
+            if (!cam.hasMask()) continue;
+
+            // World-to-camera: invert camToWorld
+            const float *d = cam.camToWorld;
+            float R[3][3], T[3];
+            for (int r = 0; r < 3; r++) {
+                R[r][0] = d[r*4+0]; R[r][1] = -d[r*4+1]; R[r][2] = -d[r*4+2];
+                T[r] = d[r*4+3];
+            }
+            // cam_pos = R^T * (point - T)
+            float dx = px - T[0], dy = py - T[1], dz = pz - T[2];
+            float cx = R[0][0]*dx + R[1][0]*dy + R[2][0]*dz;
+            float cy = R[0][1]*dx + R[1][1]*dy + R[2][1]*dz;
+            float cz = R[0][2]*dx + R[1][2]*dy + R[2][2]*dz;
+
+            if (cz <= 0.01f) continue;  // behind camera
+            float fx_s = cam.fx / dsf, fy_s = cam.fy / dsf;
+            float cx_s = cam.cx / dsf, cy_s = cam.cy / dsf;
+            int w = (int)(cam.width / dsf), h = (int)(cam.height / dsf);
+
+            float u = fx_s * (cx / cz) + cx_s;
+            float v = fy_s * (cy / cz) + cy_s;
+            int iu = (int)(u + 0.5f), iv = (int)(v + 0.5f);
+            if (iu < 0 || iu >= w || iv < 0 || iv >= h) continue;
+
+            // Look up mask
+            MTensor &maskTensor = cam.getGPUMask(dsf);
+            const float *msk = maskTensor.data<float>();
+            float mask_val = msk[iv * w + iu];
+            bg_sum += (1.0f - mask_val);  // background weight
+            valid++;
+        }
+
+        if (valid > 0) {
+            float bg_frac = bg_sum / valid;  // 0=on object, 1=in background
+            if (bg_frac > 0.3f) {
+                // Apply penalty: stronger for more background-covered splats
+                float penalty = PENALTY_WEIGHT * bg_frac * bg_frac;
+                float sig = 1.0f / (1.0f + std::exp(-op[i]));
+                float new_sig = std::clamp(sig - penalty, 1e-6f, 1.0f - 1e-6f);
+                op[i] = std::log(new_sig / (1.0f - new_sig));
+            }
+        }
+    }
+}
+
+void Model::applyMeanNoise(int step) {
+    if (!hybridRefine) return;
+    if (!radii.defined() || meanNoiseWeight <= 0.0f) return;
+    if (noiseStopAt > 0 && step >= noiseStopAt) return;
+
+    const int numPoints = means.size(0);
+    if (numPoints <= 0) return;
+
+    // Noise is generated on-GPU via PCG hash + Box-Muller — no shared buffer,
+    // no CPU write, no sync needed. Just pass the step as seed.
+    msplat_apply_mean_noise(
+        numPoints,
+        meanNoiseWeight,
+        adam_lr[0],
+        means,
+        scales,
+        quats,
+        opacities,
+        radii,
+        (uint32_t)(step ^ 0x9E3779B9u)
+    );
 }
 
 void Model::save(const std::string &filename, int step) {
@@ -594,4 +1052,5 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight, 
         visCounts, xysGradNorm, max2DSize, invMaxDim, mask);
 
     radii = r;
+    applyMeanNoise(step);
 }

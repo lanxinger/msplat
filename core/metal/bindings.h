@@ -81,7 +81,32 @@ int msplat_densify(
     MTensor &split_prefix, MTensor &dup_prefix,
     MTensor &keep_flag, MTensor &keep_prefix,
     MTensor &block_totals, MTensor &compact_scratch,
-    MTensor &random_samples
+    MTensor &random_samples,
+    int skip_dup = 0
+);
+
+// Read per-pixel alpha (1 - T) from the most recent render.
+// Must be called after msplat_render/msplat_gpu_sync and before the next render.
+void msplat_get_render_alpha(float* out, int n);
+
+void msplat_hybrid_refine(
+    int num_active, int budget, int fr_stride,
+    MTensor &donor_indices, MTensor &random_samples,
+    MTensor &means_buf, MTensor &scales_buf, MTensor &quats_buf,
+    MTensor &featuresDc_buf, MTensor &featuresRest_buf, MTensor &opacities_buf,
+    MTensor adam_exp_avg_buf[], MTensor adam_exp_avg_sq_buf[]
+);
+
+void msplat_apply_mean_noise(
+    int N,
+    float mean_noise_weight,
+    float lr_mean,
+    MTensor &means,
+    MTensor &scales,
+    MTensor &quats,
+    MTensor &opacities,
+    MTensor &radii,
+    uint32_t step_seed
 );
 
 #endif

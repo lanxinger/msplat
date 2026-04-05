@@ -411,7 +411,7 @@ kernel void project_gaussians_forward_kernel(
     uint3 gp [[thread_position_in_grid]]
 ) {
     uint idx = gp.x;
-    if (idx >= num_points) {
+    if (idx >= (uint)num_points) {
         return;
     }
     radii[idx] = 0;
@@ -810,7 +810,7 @@ kernel void map_gaussian_to_intersects_kernel(
     uint3 gp [[thread_position_in_grid]]
 ) {
     uint idx = gp.x;
-    if (idx >= num_points)
+    if (idx >= (uint)num_points)
         return;
     if (radii[idx] <= 0)
         return;
@@ -825,8 +825,8 @@ kernel void map_gaussian_to_intersects_kernel(
     // Upper 16 bits of positive float preserve ordering (sign+exponent+7 mantissa bits).
     // Reduces effective key width from ~48 to ~28 bits → 4 radix passes instead of 6.
     int64_t depth_16 = ((int64_t) * (constant int32_t *)&(depths[idx])) >> 16;
-    for (int i = tile_min.y; i < tile_max.y; ++i) {
-        for (int j = tile_min.x; j < tile_max.x; ++j) {
+    for (uint i = tile_min.y; i < tile_max.y; ++i) {
+        for (uint j = tile_min.x; j < tile_max.x; ++j) {
             if ((uint)cur_idx >= capacity) {
                 atomic_store_explicit(overflow_flag, 1u, memory_order_relaxed);
                 return;
@@ -999,8 +999,8 @@ kernel void rasterize_backward_kernel(
             // Broadcast batch data from lane 0 → all lanes in SIMD group.
             // All threads read the same index t, so one threadgroup read +
             // simd_broadcast replaces 32 redundant threadgroup reads.
-            float3 b_conic, b_xy_opac, b_rgb;
-            int32_t b_id;
+            float3 b_conic = 0, b_xy_opac = 0, b_rgb = 0;
+            int32_t b_id = 0;
             if (wr == 0) {
                 b_conic = conic_batch[t];
                 b_xy_opac = xy_opacity_batch[t];
@@ -1182,7 +1182,7 @@ kernel void nd_rasterize_backward_kernel(
         // update v_rgb for this gaussian
         const float fac = alpha * T;
         float v_alpha = 0.f;
-        for (int c = 0; c < channels; ++c) {
+        for (uint c = 0; c < channels; ++c) {
             // gradient wrt rgb
             atomic_fetch_add_explicit(v_rgb + channels * g + c, fac * v_out[c], memory_order_relaxed);
             // contribution from this pixel
@@ -1553,7 +1553,7 @@ kernel void project_gaussians_backward_kernel(
     device float* v_quat, // float4
     uint idx [[thread_position_in_grid]]
 ) {
-    if (idx >= num_points || radii[idx] <= 0) {
+    if (idx >= (uint)num_points || radii[idx] <= 0) {
         return;
     }
     float3 p_world = read_packed_float3(means3d, idx);
@@ -1686,6 +1686,78 @@ kernel void fused_adam_kernel(
 
     exp_avg[tid] = m;
     exp_avg_sq[tid] = v;
+}
+
+// Add exploration noise to gaussian means in the local anisotropic frame.
+// Only visible, low-opacity gaussians are perturbed, and the effect decays with lr_mean.
+// GPU RNG: PCG hash → uniform → Box-Muller for Gaussian samples.
+// Eliminates CPU-side random buffer writes and the sync they require.
+inline uint pcg_hash(uint input) {
+    uint state = input * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+inline float2 gpu_randn_pair(uint seed) {
+    float u1 = float(pcg_hash(seed))          / 4294967296.0f;
+    float u2 = float(pcg_hash(seed + 1u))     / 4294967296.0f;
+    u1 = max(u1, 1e-10f);  // avoid log(0)
+    float r = sqrt(-2.0f * log(u1));
+    float theta = 2.0f * M_PI_F * u2;
+    return float2(r * cos(theta), r * sin(theta));
+}
+
+kernel void apply_mean_noise_kernel(
+    constant int& N [[buffer(0)]],
+    constant float& mean_noise_weight [[buffer(1)]],
+    constant float& lr_mean [[buffer(2)]],
+    device float* means [[buffer(3)]],
+    constant float* scales [[buffer(4)]],       // [N,3] log-space
+    constant float* quats [[buffer(5)]],        // [N,4]
+    constant float* opacities [[buffer(6)]],    // [N,1] logit-space
+    constant int* radii [[buffer(7)]],          // [N]
+    constant uint& step_seed [[buffer(8)]],     // step-based seed for GPU RNG
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= (uint)N) return;
+    if (radii[idx] <= 0) return;
+
+    float alpha = 1.0f / (1.0f + exp(-opacities[idx]));
+    float inv_alpha = clamp(1.0f - alpha, 0.0f, 1.0f);
+    float noise_scale = pow(inv_alpha, 32.0f) * lr_mean * mean_noise_weight;
+    if (noise_scale <= 0.0f) return;
+
+    float sx = exp(scales[idx*3]);
+    float sy = exp(scales[idx*3+1]);
+    float sz = exp(scales[idx*3+2]);
+
+    float qw = quats[idx*4];
+    float qx = quats[idx*4+1];
+    float qy = quats[idx*4+2];
+    float qz = quats[idx*4+3];
+    float qlen = sqrt(qw*qw + qx*qx + qy*qy + qz*qz);
+    if (qlen > 1e-8f) {
+        qw /= qlen; qx /= qlen; qy /= qlen; qz /= qlen;
+    } else {
+        qw = 1.0f; qx = qy = qz = 0.0f;
+    }
+
+    // Generate 3 Gaussian samples on-GPU via PCG hash + Box-Muller
+    uint base_seed = step_seed * 0x9E3779B9u + idx * 3u;
+    float2 g01 = gpu_randn_pair(base_seed);
+    float2 g23 = gpu_randn_pair(base_seed + 0x12345678u);
+
+    float r0 = clamp(g01.x, -2.5f, 2.5f) * sx * noise_scale;
+    float r1 = clamp(g01.y, -2.5f, 2.5f) * sy * noise_scale;
+    float r2 = clamp(g23.x, -2.5f, 2.5f) * sz * noise_scale;
+
+    float v0 = (1-2*(qy*qy+qz*qz))*r0 + 2*(qx*qy-qw*qz)*r1 + 2*(qx*qz+qw*qy)*r2;
+    float v1 = 2*(qx*qy+qw*qz)*r0 + (1-2*(qx*qx+qz*qz))*r1 + 2*(qy*qz-qw*qx)*r2;
+    float v2 = 2*(qx*qz-qw*qy)*r0 + 2*(qy*qz+qw*qx)*r1 + (1-2*(qx*qx+qy*qy))*r2;
+
+    means[idx*3]   += v0;
+    means[idx*3+1] += v1;
+    means[idx*3+2] += v2;
 }
 
 // ===== Fused Projection + SH Kernels =====
@@ -2947,8 +3019,8 @@ kernel void rasterize_backward_chunked_kernel(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (int t = max(0, batch_end - warp_bin_final); t < batch_size; ++t) {
-            float3 b_conic, b_xy_opac, b_rgb;
-            int32_t b_id;
+            float3 b_conic = 0, b_xy_opac = 0, b_rgb = 0;
+            int32_t b_id = 0;
             if (wr == 0) {
                 b_conic = conic_batch[t];
                 b_xy_opac = xy_opacity_batch[t];
@@ -3277,9 +3349,21 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
             float iCD = 1.0f / (Cd * D);
             float dmu = 2.0f*B*(mu_x*Cd - A*mu_y) / (Cd*Cd*D);
             float dsyq = -A*B*iCD/D, dsxy = 2.0f*A*iCD;
-            tg_f1[dy][dx] = dmu - 2.0f*mu_y*dsyq - mu_x*dsxy;
-            tg_f2[dy][dx] = 2.0f*dsyq;
-            tg_f3[dy][dx] = dsxy;
+            float der1 = dmu - 2.0f*mu_y*dsyq - mu_x*dsxy;
+            float der2 = 2.0f*dsyq;
+            float der3 = dsxy;
+            // Pre-mask derivative fields so masked-out pixels don't bleed
+            // gradient through the backward convolution window (LichtFeld-style).
+            if (has_mask) {
+                int gx_d = base_gx + (int)dx;
+                int gy_d = base_gy + (int)(dy + SSIM_HALF_WIN);
+                float mw = (gx_d >= 0 && gx_d < (int)W && gy_d >= 0 && gy_d < (int)H)
+                           ? mask[gy_d * W + gx_d] : 0.0f;
+                der1 *= mw; der2 *= mw; der3 *= mw;
+            }
+            tg_f1[dy][dx] = der1;
+            tg_f2[dy][dx] = der2;
+            tg_f3[dy][dx] = der3;
             if (dx >= SSIM_HALF_WIN && dx < SSIM_HALF_WIN + SSIM_TG) {
                 int gpx = base_gx + (int)dx, gpy = base_gy + (int)(dy + SSIM_HALF_WIN);
                 if (gpx >= 0 && gpx < (int)W && gpy >= 0 && gpy < (int)H) {
@@ -3406,6 +3490,7 @@ kernel void ssim_v_bwd_kernel(
     device float* v_rendered,       // (H, W, 3)
     constant float* mask [[buffer(7)]],
     constant int& has_mask [[buffer(8)]],
+    constant float* background [[buffer(9)]],
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -3461,10 +3546,21 @@ kernel void ssim_v_bwd_kernel(
             float v_ssim = conv_f1 + rend_val * conv_f2 + gt_val * conv_f3;
             float v_l1 = (gt_val > rend_val) ? -1.0f : ((gt_val < rend_val) ? 1.0f : 0.0f);
 
-            float grad = inv_n * (
-                -ssim_weight * v_ssim + (1.0f - ssim_weight) * v_l1
-            );
-            if (has_mask) grad *= mask[py * W + px];
+            // SSIM gradient is already mask-weighted via pre-masked derivative
+            // fields (applied before backward convolution). L1 gradient is
+            // per-pixel and must be masked separately.
+            float grad = inv_n * (-ssim_weight * v_ssim);
+            if (has_mask) {
+                float m = mask[py * W + px];
+                grad += inv_n * (1.0f - ssim_weight) * v_l1 * m;
+                // Background opacity penalty: push rendered values toward
+                // the configured background color in masked-out regions.
+                float bg_weight = (1.0f - m) * (1.0f - m);  // (1-mask)^2
+                float bg_val = background[c];
+                grad += inv_n * 0.5f * bg_weight * (rend_val - bg_val);
+            } else {
+                grad += inv_n * (1.0f - ssim_weight) * v_l1;
+            }
             v_rendered[(py * W + px) * 3 + c] = grad;
         }
     }
@@ -3492,6 +3588,7 @@ kernel void densify_classify_kernel(
     constant int& check_screen       [[buffer(9)]],
     device int* split_flag           [[buffer(10)]],
     device int* dup_flag             [[buffer(11)]],
+    constant int& skip_dup           [[buffer(12)]],
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= (uint)N) return;
@@ -3509,7 +3606,7 @@ kernel void densify_classify_kernel(
     if (check_screen && max_2d_size[idx] > screen_thresh) do_split = true;
     do_split = do_split && high_grad;
 
-    bool do_dup = !is_large && high_grad;
+    bool do_dup = !is_large && high_grad && (skip_dup == 0);
 
     split_flag[idx] = do_split ? 1 : 0;
     dup_flag[idx]   = do_dup   ? 1 : 0;
@@ -3745,4 +3842,110 @@ kernel void zero_buffer_kernel(
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx < count) buf[idx] = 0;
+}
+
+// ============================================================================
+// Hybrid refine: GPU donor cloning kernel.
+// One thread per clone. Donors are unique (without-replacement), so parent
+// writes don't conflict. CDF build + sampling done on CPU; this kernel handles
+// the parallel clone + parent-update work.
+// ============================================================================
+kernel void hybrid_refine_kernel(
+    constant uint& num_active        [[buffer(0)]],
+    constant uint& budget            [[buffer(1)]],
+    constant int* donor_indices      [[buffer(2)]],   // [budget]
+    constant float* random_samples   [[buffer(3)]],   // [budget * 3] N(0,1)
+    device float* means_buf          [[buffer(4)]],
+    device float* scales_buf         [[buffer(5)]],
+    device float* quats_buf          [[buffer(6)]],
+    device float* featuresDc_buf     [[buffer(7)]],
+    device float* featuresRest_buf   [[buffer(8)]],
+    device float* opacities_buf      [[buffer(9)]],
+    constant int& fr_stride          [[buffer(10)]],
+    device float* adam_ea0           [[buffer(11)]],
+    device float* adam_ea1           [[buffer(12)]],
+    device float* adam_ea2           [[buffer(13)]],
+    device float* adam_ea3           [[buffer(14)]],
+    device float* adam_ea4           [[buffer(15)]],
+    device float* adam_ea5           [[buffer(16)]],
+    device float* adam_es0           [[buffer(17)]],
+    device float* adam_es1           [[buffer(18)]],
+    device float* adam_es2           [[buffer(19)]],
+    device float* adam_es3           [[buffer(20)]],
+    device float* adam_es4           [[buffer(21)]],
+    device float* adam_es5           [[buffer(22)]],
+    uint j [[thread_position_in_grid]]
+) {
+    if (j >= budget) return;
+
+    int donor = donor_indices[j];
+    int dst = (int)num_active + (int)j;
+
+    // Read parent quaternion and normalize
+    float qw = quats_buf[donor*4], qx = quats_buf[donor*4+1];
+    float qy = quats_buf[donor*4+2], qz = quats_buf[donor*4+3];
+    float qlen = sqrt(qw*qw + qx*qx + qy*qy + qz*qz);
+    if (qlen > 0) { qw /= qlen; qx /= qlen; qy /= qlen; qz /= qlen; }
+
+    // Parent scale (exp-space)
+    float sx = exp(scales_buf[donor*3]);
+    float sy = exp(scales_buf[donor*3+1]);
+    float sz = exp(scales_buf[donor*3+2]);
+
+    // Random offset: quat_rotate(parent_q, N(0,1) * scales)
+    float r0 = random_samples[j*3]   * sx;
+    float r1 = random_samples[j*3+1] * sy;
+    float r2 = random_samples[j*3+2] * sz;
+    float v0 = (1-2*(qy*qy+qz*qz))*r0 + 2*(qx*qy-qw*qz)*r1 + 2*(qx*qz+qw*qy)*r2;
+    float v1 = 2*(qx*qy+qw*qz)*r0 + (1-2*(qx*qx+qz*qz))*r1 + 2*(qy*qz-qw*qx)*r2;
+    float v2 = 2*(qx*qz-qw*qy)*r0 + 2*(qy*qz+qw*qx)*r1 + (1-2*(qx*qx+qy*qy))*r2;
+
+    // Clone position = parent + offset; parent -= offset
+    means_buf[dst*3]   = means_buf[donor*3]   + v0;
+    means_buf[dst*3+1] = means_buf[donor*3+1] + v1;
+    means_buf[dst*3+2] = means_buf[donor*3+2] + v2;
+    means_buf[donor*3]   -= v0;
+    means_buf[donor*3+1] -= v1;
+    means_buf[donor*3+2] -= v2;
+
+    // Scale: shrink largest dim by 0.5 (log-space: subtract log(2))
+    constexpr float LOG_HALF = 0.6931471805599453f;
+    int max_dim = 0;
+    if (sy > sx && sy >= sz) max_dim = 1;
+    else if (sz > sx && sz > sy) max_dim = 2;
+    scales_buf[dst*3]   = scales_buf[donor*3];
+    scales_buf[dst*3+1] = scales_buf[donor*3+1];
+    scales_buf[dst*3+2] = scales_buf[donor*3+2];
+    scales_buf[dst*3 + max_dim] -= LOG_HALF;
+    scales_buf[donor*3 + max_dim] -= LOG_HALF;
+
+    // Quaternion + features: copy parent
+    for (int c = 0; c < 4; c++) quats_buf[dst*4+c] = quats_buf[donor*4+c];
+    for (int c = 0; c < 3; c++) featuresDc_buf[dst*3+c] = featuresDc_buf[donor*3+c];
+    for (int c = 0; c < fr_stride; c++)
+        featuresRest_buf[dst*fr_stride+c] = featuresRest_buf[donor*fr_stride+c];
+
+    // Opacity: fair split — both parent and clone get reduced opacity
+    float parent_sig = 1.0f / (1.0f + exp(-opacities_buf[donor]));
+    float clone_opac = 1.0f - sqrt(max(0.0f, 1.0f - parent_sig));
+    clone_opac = clamp(clone_opac, 1.0f/255.0f, 1.0f - 1.0f/255.0f);
+    float clone_logit = log(clone_opac / (1.0f - clone_opac));
+    opacities_buf[dst] = clone_logit;
+    opacities_buf[donor] = clone_logit;
+
+    // Zero optimizer state for clone
+    for (int c = 0; c < 3; c++) { adam_ea0[dst*3+c] = 0; adam_es0[dst*3+c] = 0; }
+    for (int c = 0; c < 3; c++) { adam_ea1[dst*3+c] = 0; adam_es1[dst*3+c] = 0; }
+    for (int c = 0; c < 4; c++) { adam_ea2[dst*4+c] = 0; adam_es2[dst*4+c] = 0; }
+    for (int c = 0; c < 3; c++) { adam_ea3[dst*3+c] = 0; adam_es3[dst*3+c] = 0; }
+    for (int c = 0; c < fr_stride; c++) { adam_ea4[dst*fr_stride+c] = 0; adam_es4[dst*fr_stride+c] = 0; }
+    adam_ea5[dst] = 0; adam_es5[dst] = 0;
+
+    // Zero optimizer state for donor (mean, scale, opacity were mutated in-place)
+    for (int c = 0; c < 3; c++) { adam_ea0[donor*3+c] = 0; adam_es0[donor*3+c] = 0; }
+    for (int c = 0; c < 3; c++) { adam_ea1[donor*3+c] = 0; adam_es1[donor*3+c] = 0; }
+    for (int c = 0; c < 4; c++) { adam_ea2[donor*4+c] = 0; adam_es2[donor*4+c] = 0; }
+    for (int c = 0; c < 3; c++) { adam_ea3[donor*3+c] = 0; adam_es3[donor*3+c] = 0; }
+    for (int c = 0; c < fr_stride; c++) { adam_ea4[donor*fr_stride+c] = 0; adam_es4[donor*fr_stride+c] = 0; }
+    adam_ea5[donor] = 0; adam_es5[donor] = 0;
 }

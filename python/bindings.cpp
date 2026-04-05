@@ -36,13 +36,17 @@ struct TrainingConfig {
     float densify_size_thresh = 0.01f;
     int stop_screen_size_at = 4000;
     float split_screen_size = 0.05f;
+    float mean_noise_weight = 50.0f;
+    int noise_stop_at = 15000;
+    bool hybrid_refine = false;
+    int max_splats = 0;
     bool keep_crs = false;
     float downscale_factor = 1.0f;
     std::string output = "splat.ply";
     int save_every = -1;
     // Magenta default — high contrast against typical scenes, makes
     // under-reconstructed regions obvious during training.
-    std::vector<float> bg_color = {0.6130f, 0.0101f, 0.3984f};
+    std::vector<float> bg_color = {0.0f, 0.0f, 0.0f};
 };
 
 // ── TrainingStats ───────────────────────────────────────────────────────────
@@ -121,7 +125,8 @@ public:
             cfg.refine_every, cfg.warmup_length, cfg.reset_alpha_every,
             cfg.densify_grad_thresh, cfg.densify_size_thresh,
             cfg.stop_screen_size_at, cfg.split_screen_size,
-            cfg.iterations, cfg.keep_crs,
+            cfg.iterations, cfg.keep_crs, cfg.mean_noise_weight, cfg.noise_stop_at,
+            cfg.hybrid_refine, cfg.max_splats,
             cfg.bg_color.data()
         );
 
@@ -148,12 +153,14 @@ public:
 
         int ds = model->getDownscaleFactor(current_step);
         MTensor &gt = cam.getGPUImage(ds);
+        MTensor *maskPtr = cam.hasMask() ? &cam.getGPUMask(ds) : nullptr;
 
         auto t0 = std::chrono::high_resolution_clock::now();
 
-        model->fullIteration(cam, current_step, gt, config.ssim_weight);
+        model->fullIteration(cam, current_step, gt, config.ssim_weight, maskPtr);
         model->schedulersStep(current_step);
         model->afterTrain(current_step);
+        model->applyMaskOpacityPenalty(dataset_ptr->train_cams, current_step);
         msplat_commit();
 
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -193,10 +200,16 @@ public:
             MTensor rgb_cpu = rgb.cpu();
             int ds = model->getDownscaleFactor(config.iterations);
             MTensor gt_cpu = cam.getGPUImage(ds).cpu();
+            MTensor mask_cpu;
+            MTensor *mask_eval = nullptr;
+            if (cam.hasMask()) {
+                mask_cpu = cam.getGPUMask(ds).cpu();
+                mask_eval = &mask_cpu;
+            }
 
-            sum_psnr += psnr(rgb_cpu, gt_cpu);
-            sum_ssim += ssim_eval(rgb_cpu, gt_cpu);
-            sum_l1 += l1_loss(rgb_cpu, gt_cpu);
+            sum_psnr += psnr(rgb_cpu, gt_cpu, mask_eval);
+            sum_ssim += ssim_eval(rgb_cpu, gt_cpu, 11, 1.5f, mask_eval);
+            sum_l1 += l1_loss(rgb_cpu, gt_cpu, mask_eval);
         }
 
         nb::dict result;
@@ -295,7 +308,9 @@ NB_MODULE(_core, m) {
                 int stop_screen_size_at, float split_screen_size,
                 bool keep_crs, float downscale_factor,
                 const std::string &output, int save_every,
-                std::vector<float> bg_color) {
+                std::vector<float> bg_color,
+                float mean_noise_weight, int noise_stop_at,
+                bool hybrid_refine, int max_splats) {
             new (cfg) TrainingConfig();
             cfg->iterations = iterations;
             cfg->sh_degree = sh_degree;
@@ -317,6 +332,10 @@ NB_MODULE(_core, m) {
             if (bg_color.size() != 3)
                 throw std::invalid_argument("bg_color must have exactly 3 elements [R, G, B]");
             cfg->bg_color = bg_color;
+            cfg->mean_noise_weight = mean_noise_weight;
+            cfg->noise_stop_at = noise_stop_at;
+            cfg->hybrid_refine = hybrid_refine;
+            cfg->max_splats = max_splats;
         },
             "iterations"_a = 30000,
             "sh_degree"_a = 3,
@@ -335,7 +354,11 @@ NB_MODULE(_core, m) {
             "downscale_factor"_a = 1.0f,
             "output"_a = "splat.ply",
             "save_every"_a = -1,
-            "bg_color"_a = std::vector<float>{0.6130f, 0.0101f, 0.3984f})
+            "bg_color"_a = std::vector<float>{0.0f, 0.0f, 0.0f},
+            "mean_noise_weight"_a = 50.0f,
+            "noise_stop_at"_a = 15000,
+            "hybrid_refine"_a = false,
+            "max_splats"_a = 0)
         .def_rw("iterations", &TrainingConfig::iterations)
         .def_rw("sh_degree", &TrainingConfig::sh_degree)
         .def_rw("sh_degree_interval", &TrainingConfig::sh_degree_interval)
@@ -349,6 +372,10 @@ NB_MODULE(_core, m) {
         .def_rw("densify_size_thresh", &TrainingConfig::densify_size_thresh)
         .def_rw("stop_screen_size_at", &TrainingConfig::stop_screen_size_at)
         .def_rw("split_screen_size", &TrainingConfig::split_screen_size)
+        .def_rw("mean_noise_weight", &TrainingConfig::mean_noise_weight)
+        .def_rw("noise_stop_at", &TrainingConfig::noise_stop_at)
+        .def_rw("hybrid_refine", &TrainingConfig::hybrid_refine)
+        .def_rw("max_splats", &TrainingConfig::max_splats)
         .def_rw("keep_crs", &TrainingConfig::keep_crs)
         .def_rw("downscale_factor", &TrainingConfig::downscale_factor)
         .def_rw("output", &TrainingConfig::output)

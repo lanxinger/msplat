@@ -136,7 +136,8 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
         config.refineEvery, config.warmupLength, config.resetAlphaEvery,
         config.densifyGradThresh, config.densifySizeThresh,
         config.stopScreenSizeAt, config.splitScreenSize,
-        config.iterations, config.keepCrs,
+        config.iterations, config.keepCrs, config.meanNoiseWeight, config.noiseStopAt,
+        config.hybridRefine, config.maxSplats,
         config.bgColor
     );
 
@@ -182,6 +183,7 @@ Stats Trainer::step() {
     impl->model->fullIteration(cam, impl->currentStep, gt, impl->config.ssimWeight, maskPtr);
     impl->model->schedulersStep(impl->currentStep);
     impl->model->afterTrain(impl->currentStep);
+    impl->model->applyMaskOpacityPenalty(impl->ds->trainCams, impl->currentStep);
     msplat_commit();
 
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -217,10 +219,16 @@ EvalMetrics Trainer::evaluate() {
         MTensor rgbCpu = rgb.cpu();
         int dsf = impl->model->getDownscaleFactor(impl->config.iterations);
         MTensor gtCpu = cam.getGPUImage(dsf).cpu();
+        MTensor maskCpu;
+        MTensor *maskEval = nullptr;
+        if (cam.hasMask()) {
+            maskCpu = cam.getGPUMask(dsf).cpu();
+            maskEval = &maskCpu;
+        }
 
-        sumPsnr += psnr(rgbCpu, gtCpu);
-        sumSsim += ssim_eval(rgbCpu, gtCpu);
-        sumL1 += l1_loss(rgbCpu, gtCpu);
+        sumPsnr += psnr(rgbCpu, gtCpu, maskEval);
+        sumSsim += ssim_eval(rgbCpu, gtCpu, 11, 1.5f, maskEval);
+        sumL1 += l1_loss(rgbCpu, gtCpu, maskEval);
     }
 
     EvalMetrics m;
@@ -293,14 +301,25 @@ void Trainer::renderFromPoseToBuffer(const float camToWorld[16], int refCameraIn
     *outHeight = h;
     if (!outRGBA) return;
 
-    // Read directly from GPU tensor (unified memory on Apple Silicon)
+    // Read RGB + alpha from rasterizer transmittance (1 - T).
+    // The rasterizer composites: rgb_out = splat_rgb + T * bgColor.
+    // Unblend the background to recover premultiplied-alpha RGBA
+    // (CGImage premultipliedLast): premul = rgb_out - (1-a) * bg.
     const float* src = (const float*)rgb.data_ptr();
+    const float* bg = (const float*)impl->model->backgroundColor.data_ptr();
     int n = w * h;
+    std::vector<float> alpha(n);
+    msplat_get_render_alpha(alpha.data(), n);
     for (int i = 0; i < n; i++) {
-        outRGBA[i * 4]     = (uint8_t)(fminf(fmaxf(src[i*3],   0.f), 1.f) * 255.f);
-        outRGBA[i * 4 + 1] = (uint8_t)(fminf(fmaxf(src[i*3+1], 0.f), 1.f) * 255.f);
-        outRGBA[i * 4 + 2] = (uint8_t)(fminf(fmaxf(src[i*3+2], 0.f), 1.f) * 255.f);
-        outRGBA[i * 4 + 3] = 255;
+        float a = fminf(fmaxf(alpha[i], 0.f), 1.f);
+        float one_minus_a = 1.0f - a;
+        float r = src[i*3]   - one_minus_a * bg[0];
+        float g = src[i*3+1] - one_minus_a * bg[1];
+        float b = src[i*3+2] - one_minus_a * bg[2];
+        outRGBA[i * 4]     = (uint8_t)(fminf(fmaxf(r, 0.f), 1.f) * 255.f);
+        outRGBA[i * 4 + 1] = (uint8_t)(fminf(fmaxf(g, 0.f), 1.f) * 255.f);
+        outRGBA[i * 4 + 2] = (uint8_t)(fminf(fmaxf(b, 0.f), 1.f) * 255.f);
+        outRGBA[i * 4 + 3] = (uint8_t)(a * 255.f);
     }
 }
 
@@ -321,12 +340,20 @@ void Trainer::renderWithIntrinsicsToBuffer(const float camToWorld[16],
     if (!outRGBA) return;
 
     const float* src = (const float*)rgb.data_ptr();
+    const float* bg = (const float*)impl->model->backgroundColor.data_ptr();
     int n = w * h;
+    std::vector<float> alpha(n);
+    msplat_get_render_alpha(alpha.data(), n);
     for (int i = 0; i < n; i++) {
-        outRGBA[i * 4]     = (uint8_t)(fminf(fmaxf(src[i*3],   0.f), 1.f) * 255.f);
-        outRGBA[i * 4 + 1] = (uint8_t)(fminf(fmaxf(src[i*3+1], 0.f), 1.f) * 255.f);
-        outRGBA[i * 4 + 2] = (uint8_t)(fminf(fmaxf(src[i*3+2], 0.f), 1.f) * 255.f);
-        outRGBA[i * 4 + 3] = 255;
+        float a = fminf(fmaxf(alpha[i], 0.f), 1.f);
+        float one_minus_a = 1.0f - a;
+        float r = src[i*3]   - one_minus_a * bg[0];
+        float g = src[i*3+1] - one_minus_a * bg[1];
+        float b = src[i*3+2] - one_minus_a * bg[2];
+        outRGBA[i * 4]     = (uint8_t)(fminf(fmaxf(r, 0.f), 1.f) * 255.f);
+        outRGBA[i * 4 + 1] = (uint8_t)(fminf(fmaxf(g, 0.f), 1.f) * 255.f);
+        outRGBA[i * 4 + 2] = (uint8_t)(fminf(fmaxf(b, 0.f), 1.f) * 255.f);
+        outRGBA[i * 4 + 3] = (uint8_t)(a * 255.f);
     }
 }
 
@@ -394,6 +421,10 @@ static msplat::Config configFromC(MsplatConfig c) {
     cfg.densifySizeThresh = c.densifySizeThresh;
     cfg.stopScreenSizeAt = c.stopScreenSizeAt;
     cfg.splitScreenSize = c.splitScreenSize;
+    cfg.meanNoiseWeight = c.meanNoiseWeight;
+    cfg.noiseStopAt = c.noiseStopAt;
+    cfg.hybridRefine = c.hybridRefine;
+    cfg.maxSplats = c.maxSplats;
     cfg.keepCrs = c.keepCrs;
     cfg.downscaleFactor = c.downscaleFactor;
     memcpy(cfg.bgColor, c.bgColor, sizeof(cfg.bgColor));

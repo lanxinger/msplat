@@ -59,7 +59,8 @@ static void gaussianBlur(const float* in, float* out, float* tmp,
 }
 
 float ssim_eval(const MTensor& rendered, const MTensor& gt,
-                int windowSize, float sigma) {
+                int windowSize, float sigma,
+                const MTensor* mask) {
     int H = rendered.size(0);
     int W = rendered.size(1);
     int C = rendered.size(2);
@@ -87,9 +88,12 @@ float ssim_eval(const MTensor& rendered, const MTensor& gt,
     const float C2 = 0.03f * 0.03f;
     double ssim_sum = 0;
     int count = 0;
+    const float *msk = mask ? mask->data<float>() : nullptr;
 
+    // Compute standard SSIM on unmodified images, then mask the final average.
+    // Don't zero/weight inputs before blurring — that corrupts the Gaussian
+    // window statistics for pixels near the mask boundary.
     for (int c = 0; c < C; c++) {
-        // Extract channel (HWC → planar)
         for (int i = 0; i < HW; i++) {
             r_ch[i] = r[i * C + c];
             g_ch[i] = g[i * C + c];
@@ -105,6 +109,8 @@ float ssim_eval(const MTensor& rendered, const MTensor& gt,
         gaussianBlur(rg.data(), s_rg.data(), tmp.data(), H, W, kernel.data(), windowSize);
 
         for (int i = 0; i < HW; i++) {
+            if (msk && msk[i] < 0.5f) continue;
+
             float m1sq = mu1[i] * mu1[i];
             float m2sq = mu2[i] * mu2[i];
             float m12  = mu1[i] * mu2[i];
@@ -119,5 +125,5 @@ float ssim_eval(const MTensor& rendered, const MTensor& gt,
         }
     }
 
-    return (float)(ssim_sum / count);
+    return (count > 0) ? (float)(ssim_sum / count) : 0.0f;
 }

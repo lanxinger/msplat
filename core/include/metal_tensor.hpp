@@ -53,7 +53,7 @@ public:
         size_t bytes = _numel * dtypeSize(_dtype);
         if (bytes == 0) bytes = 4;
         id<MTLBuffer> buf = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-        _buffer = (__bridge_retained void*)buf;
+        _buffer = (__bridge void*)buf;  // non-ARC: newBuffer already +1 retained, CFRelease handles release
         _data = [buf contents];  // cache CPU-accessible pointer for C++ access
     }
 
