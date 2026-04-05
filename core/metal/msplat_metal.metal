@@ -584,6 +584,84 @@ kernel void nd_rasterize_forward_kernel(
     }
 }
 
+kernel void rasterize_edge_scores_kernel(
+    constant uint3& tile_bounds,
+    constant uint2& img_size,
+    constant int32_t* gaussian_ids_sorted,
+    constant int* tile_bins, // int2
+    constant float* packed_xy_opac, // float3: (x, y, sigmoid(opacity))
+    constant float* packed_conic,   // float3
+    constant float* edge_map,       // single channel
+    device atomic_float* edge_scores,
+    uint2 blockIdx [[threadgroup_position_in_grid]],
+    uint2 threadIdx [[thread_position_in_threadgroup]],
+    uint tr [[thread_index_in_threadgroup]]
+) {
+    int32_t i = blockIdx.y * RAST_BLOCK_Y + threadIdx.y;
+    int32_t j = blockIdx.x * RAST_BLOCK_X + threadIdx.x;
+    int32_t tile_id = ((int)i / BLOCK_Y) * tile_bounds.x + ((int)j / BLOCK_X);
+    int32_t pix_id = i * (int)img_size.x + j;
+    const bool inside = (i < (int)img_size.y && j < (int)img_size.x);
+    const float edge = inside ? edge_map[pix_id] : 0.0f;
+    const bool active = inside && edge > 0.0f;
+
+    int2 range = read_packed_int2(tile_bins, tile_id);
+    const int num_batches = (range.y - range.x + RAST_BLOCK_SIZE - 1) / RAST_BLOCK_SIZE;
+
+    threadgroup int32_t id_batch[RAST_BLOCK_SIZE];
+    threadgroup float3 xy_opacity_batch[RAST_BLOCK_SIZE];
+    threadgroup float3 conic_batch[RAST_BLOCK_SIZE];
+
+    const float px = (float)j;
+    const float py = (float)i;
+    float T = 1.0f;
+    bool done = false;
+
+    for (int b = 0; b < num_batches; ++b) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        int batch_start = range.x + RAST_BLOCK_SIZE * b;
+        int idx = batch_start + tr;
+        if (idx < range.y) {
+            id_batch[tr] = gaussian_ids_sorted[idx];
+            xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
+            conic_batch[tr] = read_packed_float3(packed_conic, idx);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (done || !active) continue;
+
+        int batch_size = min(RAST_BLOCK_SIZE, range.y - batch_start);
+        for (int t = 0; t < batch_size; ++t) {
+            const float3 conic_local = conic_batch[t];
+            const float3 xy_opac = xy_opacity_batch[t];
+            const float2 delta = {xy_opac.x - px, xy_opac.y - py};
+
+            const float sigma = fma(0.5f,
+                fma(conic_local.x, delta.x * delta.x, conic_local.z * delta.y * delta.y),
+                conic_local.y * delta.x * delta.y);
+            if (sigma < 0.f || sigma >= 5.55f) {
+                continue;
+            }
+
+            const float alpha = min(0.999f, xy_opac.z * exp(-sigma));
+            if (alpha < 1.f / 255.f) {
+                continue;
+            }
+
+            const float fac = alpha * T;
+            atomic_fetch_add_explicit(edge_scores + id_batch[t], fac * edge, memory_order_relaxed);
+
+            const float next_T = T * (1.0f - alpha);
+            if (next_T <= 1e-4f) {
+                done = true;
+                break;
+            }
+            T = next_T;
+        }
+    }
+}
+
 void sh_coeffs_to_color(
     const uint degree,
     const float3 viewdir,
@@ -908,6 +986,10 @@ kernel void rasterize_backward_kernel(
     constant int* final_index,
     constant float* v_output, // float3
     constant float* v_alpha_img,
+    constant float* densify_error_map,
+    constant int& densification_mode,
+    device atomic_float* densify_vis,
+    device atomic_float* densify_score,
     device atomic_float* v_xy, // float2
     device atomic_float* v_conic, // float3
     device atomic_float* v_rgb, // float3
@@ -1047,6 +1129,8 @@ kernel void rasterize_backward_kernel(
             float3 v_conic_local = {0.f, 0.f, 0.f};
             float2 v_xy_local = {0.f, 0.f};
             float v_opacity_local = 0.f;
+            float densify_vis_local = 0.f;
+            float densify_score_local = 0.f;
             //initialize everything to 0, only set if the lane is valid
             if(valid && alpha<0.999f){
                 // compute the current T for this gaussian
@@ -1075,12 +1159,20 @@ kernel void rasterize_backward_kernel(
                     fma(b_conic.y, delta.x, b_conic.z * delta.y));
                 // Fused sigmoid derivative: dL/d(logit) = -v_sigma * (1 - opac)
                 v_opacity_local = -v_sigma * (1.f - opac);
+
+                if (densification_mode == 1) {
+                    float pixel_error = densify_error_map[pix_id];
+                    densify_vis_local = fac;
+                    densify_score_local = fac * pixel_error;
+                }
             }
 
             v_rgb_local = warpSum3(v_rgb_local, warp_size, wr);
             v_conic_local = warpSum3(v_conic_local, warp_size, wr);
             v_xy_local = warpSum2(v_xy_local, warp_size, wr);
             v_opacity_local = warpSum(v_opacity_local, warp_size, wr);
+            densify_vis_local = warpSum(densify_vis_local, warp_size, wr);
+            densify_score_local = warpSum(densify_score_local, warp_size, wr);
 
             if (wr == 0) {
                 // Fused clamp_min backward: zero gradient where raw_color + 0.5 < 0
@@ -1096,6 +1188,10 @@ kernel void rasterize_backward_kernel(
                 atomic_fetch_add_explicit(v_xy + 2*b_id + 1, v_xy_local.y, memory_order_relaxed);
 
                 atomic_fetch_add_explicit(v_opacity + b_id, v_opacity_local, memory_order_relaxed);
+                if (densification_mode == 1) {
+                    atomic_fetch_add_explicit(densify_vis + b_id, densify_vis_local, memory_order_relaxed);
+                    atomic_fetch_add_explicit(densify_score + b_id, densify_score_local, memory_order_relaxed);
+                }
             }
         }
     }
@@ -1651,16 +1747,19 @@ kernel void accumulate_grad_stats_kernel(
     device float* xys_grad_norm [[buffer(4)]],   // (N,) in-place
     device float* max_2d_size [[buffer(5)]],     // (N,) in-place
     constant float& inv_max_dim [[buffer(6)]],   // 1.0 / max(H, W)
+    constant int& densification_mode [[buffer(7)]],
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= (uint)num_points) return;
     if (radii[idx] <= 0) return;
 
-    vis_counts[idx] += 1.0f;
+    if (densification_mode == 0) {
+        vis_counts[idx] += 1.0f;
 
-    float gx = xys_grad[idx * 2];
-    float gy = xys_grad[idx * 2 + 1];
-    xys_grad_norm[idx] += sqrt(gx * gx + gy * gy);
+        float gx = xys_grad[idx * 2];
+        float gy = xys_grad[idx * 2 + 1];
+        xys_grad_norm[idx] += sqrt(gx * gx + gy * gy);
+    }
 
     float r = (float)radii[idx] * inv_max_dim;
     max_2d_size[idx] = max(max_2d_size[idx], r);
@@ -2946,6 +3045,10 @@ kernel void rasterize_backward_chunked_kernel(
     constant float* after_C_buf,    // [K_max, H, W, 3]
     constant float* v_output,
     constant float* v_alpha_img,
+    constant float* densify_error_map,
+    constant int& densification_mode,
+    device atomic_float* densify_vis,
+    device atomic_float* densify_score,
     device atomic_float* v_xy,
     device atomic_float* v_conic,
     device atomic_float* v_rgb,
@@ -3079,6 +3182,8 @@ kernel void rasterize_backward_chunked_kernel(
             float3 v_conic_local = {0.f, 0.f, 0.f};
             float2 v_xy_local = {0.f, 0.f};
             float v_opacity_local = 0.f;
+            float densify_vis_local = 0.f;
+            float densify_score_local = 0.f;
 
             if (valid && alpha < 0.999f) {
                 float ra = 1.f / (1.f - alpha);
@@ -3100,12 +3205,19 @@ kernel void rasterize_backward_chunked_kernel(
                     fma(b_conic.x, delta.x, b_conic.y * delta.y),
                     fma(b_conic.y, delta.x, b_conic.z * delta.y));
                 v_opacity_local = -v_sigma * (1.f - opac);
+                if (densification_mode == 1) {
+                    float pixel_error = densify_error_map[pix_id];
+                    densify_vis_local = fac;
+                    densify_score_local = fac * pixel_error;
+                }
             }
 
             v_rgb_local = warpSum3(v_rgb_local, warp_size, wr);
             v_conic_local = warpSum3(v_conic_local, warp_size, wr);
             v_xy_local = warpSum2(v_xy_local, warp_size, wr);
             v_opacity_local = warpSum(v_opacity_local, warp_size, wr);
+            densify_vis_local = warpSum(densify_vis_local, warp_size, wr);
+            densify_score_local = warpSum(densify_score_local, warp_size, wr);
 
             if (wr == 0) {
                 if (b_rgb.x + 0.5f >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 0, v_rgb_local.x, memory_order_relaxed);
@@ -3117,6 +3229,10 @@ kernel void rasterize_backward_chunked_kernel(
                 atomic_fetch_add_explicit(v_xy + 2*b_id + 0, v_xy_local.x, memory_order_relaxed);
                 atomic_fetch_add_explicit(v_xy + 2*b_id + 1, v_xy_local.y, memory_order_relaxed);
                 atomic_fetch_add_explicit(v_opacity + b_id, v_opacity_local, memory_order_relaxed);
+                if (densification_mode == 1) {
+                    atomic_fetch_add_explicit(densify_vis + b_id, densify_vis_local, memory_order_relaxed);
+                    atomic_fetch_add_explicit(densify_score + b_id, densify_score_local, memory_order_relaxed);
+                }
             }
         }
     }
@@ -3323,6 +3439,7 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
     constant float* mask [[buffer(8)]],
     constant int& has_mask [[buffer(9)]],
     constant float* final_Ts [[buffer(10)]],
+    device float* densify_error_map [[buffer(11)]],
     uint2 gid [[thread_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]], uint2 tgid [[threadgroup_position_in_grid]],
     uint2 tg_size [[threads_per_threadgroup]]
@@ -3413,6 +3530,9 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
         float bg_weight = (1.0f - m) * (1.0f - m);
         float alpha = 1.0f - final_Ts[py * W + px];
         pixel_loss = m * pixel_loss + bg_weight * alpha;
+    }
+    if (px < W && py < H) {
+        densify_error_map[py * W + px] = pixel_loss;
     }
     threadgroup float tg_sum[256];
     tg_sum[tr] = pixel_loss;

@@ -43,7 +43,7 @@ def main():
         ssim_weight: float = 0.2
         """SSIM loss weight"""
 
-        refine_every: int = 100
+        refine_every: int = 200
         """Densification interval"""
 
         warmup_length: int = 500

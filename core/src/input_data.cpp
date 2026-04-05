@@ -62,6 +62,115 @@ static std::string findMaskPath(const std::string &imagePath, const std::string 
     return "";
 }
 
+static float positiveMedian(std::vector<float> values) {
+    values.erase(
+        std::remove_if(values.begin(), values.end(), [](float v) { return !(v > 0.0f); }),
+        values.end());
+    if (values.empty()) return 1.0f;
+    size_t mid = values.size() / 2;
+    std::nth_element(values.begin(), values.begin() + mid, values.end());
+    return std::max(values[mid], 1e-6f);
+}
+
+static MTensor buildEdgeMapFromImage(const MTensor &image) {
+    const int h = static_cast<int>(image.size(0));
+    const int w = static_cast<int>(image.size(1));
+    const float *rgb = image.data<float>();
+
+    std::vector<float> gray(h * w, 0.0f);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const int idx = (y * w + x) * 3;
+            gray[y * w + x] = 0.299f * rgb[idx] + 0.587f * rgb[idx + 1] + 0.114f * rgb[idx + 2];
+        }
+    }
+
+    // Match the LFS edge-guidance intent closely enough for scoring:
+    // light Gaussian smoothing, Sobel gradients, then Canny-style NMS.
+    static constexpr float kBlur[5] = {1.0f / 16.0f, 4.0f / 16.0f, 6.0f / 16.0f, 4.0f / 16.0f, 1.0f / 16.0f};
+    auto clampX = [w](int x) { return std::clamp(x, 0, w - 1); };
+    auto clampY = [h](int y) { return std::clamp(y, 0, h - 1); };
+
+    std::vector<float> blurX(h * w, 0.0f);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            float acc = 0.0f;
+            for (int k = -2; k <= 2; ++k)
+                acc += gray[y * w + clampX(x + k)] * kBlur[k + 2];
+            blurX[y * w + x] = acc;
+        }
+    }
+
+    std::vector<float> blur(h * w, 0.0f);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            float acc = 0.0f;
+            for (int k = -2; k <= 2; ++k)
+                acc += blurX[clampY(y + k) * w + x] * kBlur[k + 2];
+            blur[y * w + x] = acc;
+        }
+    }
+
+    std::vector<float> magnitude(h * w, 0.0f);
+    std::vector<uint8_t> direction(h * w, 0);
+    for (int y = 1; y < h - 1; ++y) {
+        for (int x = 1; x < w - 1; ++x) {
+            float gx =
+                -blur[(y - 1) * w + (x - 1)] + blur[(y - 1) * w + (x + 1)] +
+                -2.0f * blur[y * w + (x - 1)] + 2.0f * blur[y * w + (x + 1)] +
+                -blur[(y + 1) * w + (x - 1)] + blur[(y + 1) * w + (x + 1)];
+            float gy =
+                 blur[(y - 1) * w + (x - 1)] + 2.0f * blur[(y - 1) * w + x] + blur[(y - 1) * w + (x + 1)] -
+                 blur[(y + 1) * w + (x - 1)] - 2.0f * blur[(y + 1) * w + x] - blur[(y + 1) * w + (x + 1)];
+            float mag = std::sqrt(gx * gx + gy * gy);
+            magnitude[y * w + x] = mag;
+
+            float angle = std::atan2(gy, gx) * (180.0f / static_cast<float>(M_PI));
+            if (angle < 0.0f) angle += 180.0f;
+            if (angle < 22.5f || angle >= 157.5f) direction[y * w + x] = 0;
+            else if (angle < 67.5f) direction[y * w + x] = 1;
+            else if (angle < 112.5f) direction[y * w + x] = 2;
+            else direction[y * w + x] = 3;
+        }
+    }
+
+    MTensor edges = gpu_zeros({h, w}, DType::Float32);
+    float *out = edges.data<float>();
+    for (int y = 1; y < h - 1; ++y) {
+        for (int x = 1; x < w - 1; ++x) {
+            const int idx = y * w + x;
+            const float mag = magnitude[idx];
+            float n0 = 0.0f, n1 = 0.0f;
+            switch (direction[idx]) {
+                case 0:
+                    n0 = magnitude[idx - 1];
+                    n1 = magnitude[idx + 1];
+                    break;
+                case 1:
+                    n0 = magnitude[(y - 1) * w + (x + 1)];
+                    n1 = magnitude[(y + 1) * w + (x - 1)];
+                    break;
+                case 2:
+                    n0 = magnitude[(y - 1) * w + x];
+                    n1 = magnitude[(y + 1) * w + x];
+                    break;
+                default:
+                    n0 = magnitude[(y - 1) * w + (x - 1)];
+                    n1 = magnitude[(y + 1) * w + (x + 1)];
+                    break;
+            }
+            out[idx] = (mag >= n0 && mag >= n1) ? mag : 0.0f;
+        }
+    }
+
+    std::vector<float> positives(out, out + static_cast<size_t>(h) * static_cast<size_t>(w));
+    const float median = positiveMedian(std::move(positives));
+    const float invMedian = 1.0f / median;
+    for (int i = 0; i < h * w; ++i)
+        if (out[i] > 0.0f) out[i] *= invMedian;
+    return edges;
+}
+
 void Camera::loadImage(float downscaleFactor, const std::string &maskDir) {
     // Save original metadata dimensions for computing final target
     int metaW = width, metaH = height;
@@ -179,6 +288,14 @@ MTensor& Camera::getGPUMask(int downscaleFactor) {
     memcpy(mt.data_ptr(), m.ptr(), m.width * m.height * sizeof(float));
     mtensorMaskCache[downscaleFactor] = std::move(mt);
     return mtensorMaskCache[downscaleFactor];
+}
+
+MTensor& Camera::getGPUEdgeMap(int downscaleFactor) {
+    auto it = mtensorEdgeCache.find(downscaleFactor);
+    if (it != mtensorEdgeCache.end()) return it->second;
+    MTensor &imageTensor = getGPUImage(downscaleFactor);
+    mtensorEdgeCache[downscaleFactor] = buildEdgeMapFromImage(imageTensor);
+    return mtensorEdgeCache[downscaleFactor];
 }
 
 void Camera::releaseCPUData() {

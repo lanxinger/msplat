@@ -45,6 +45,19 @@ MTensor msplat_render(
     MTensor &opacities, MTensor &background
 );
 
+// Rasterize visibility-weighted edge scores per Gaussian using an external edge map.
+// Returns: edge_scores [num_points]
+MTensor msplat_render_edge_scores(
+    int num_points, MTensor &means3d, MTensor &scales, float glob_scale,
+    MTensor &quats, MTensor &viewmat, MTensor &projmat,
+    float fx, float fy, float cx, float cy,
+    unsigned img_height, unsigned img_width,
+    const std::tuple<int, int, int> tile_bounds, float clip_thresh,
+    unsigned degree, unsigned degrees_to_use, float cam_pos[3],
+    MTensor &features_dc, MTensor &features_rest,
+    MTensor &opacities, MTensor &edge_map
+);
+
 // Fused forward + backward + Adam + grad_stats in one encoder
 // Returns: (radii [N], loss_value float)
 std::tuple<MTensor, float> msplat_train_step(
@@ -64,6 +77,7 @@ std::tuple<MTensor, float> msplat_train_step(
     float adam_beta1, float adam_beta2, float adam_eps,
     MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
     float inv_max_dim,
+    int densification_mode,
     MTensor *mask = nullptr
 );
 

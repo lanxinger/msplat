@@ -73,7 +73,7 @@ int main(int argc, char *argv[]) {
     float ssimWeight = 0.2f;
     app.add_option("--ssim-weight", ssimWeight, "SSIM loss weight (0 = L1 only)")
         ->check(CLI::Range(0.0f, 1.0f));
-    int refineEvery = 100;
+    int refineEvery = 200;
     app.add_option("--refine-every", refineEvery, "Densify/prune every N steps");
     int warmupLength = 500;
     app.add_option("--warmup-length", warmupLength, "Steps before first densification");
@@ -98,8 +98,8 @@ int main(int argc, char *argv[]) {
     std::string strategyName = "classic";
     app.add_option("--strategy", strategyName, "Training strategy: classic, hybrid, mrnf, igsplus")
         ->check(CLI::IsMember({"classic", "hybrid", "mrnf", "igsplus"}));
-    int maxSplats = 0;
-    app.add_option("--max-splats", maxSplats, "Max splat count for hybrid refine (0 = no cap)")
+    int maxSplats = 1000000;
+    app.add_option("--max-splats", maxSplats, "Max splat count (0 = no cap)")
         ->check(CLI::Range(0, 100000000));
     float hybridGrowthFloorDivisor = 33.0f;
     app.add_option("--hybrid-growth-floor-divisor", hybridGrowthFloorDivisor,
@@ -123,10 +123,10 @@ int main(int argc, char *argv[]) {
     float boundsPercentile = 0.8f;
     app.add_option("--bounds-percentile", boundsPercentile, "MRNF percentile used to estimate scene bounds")
         ->check(CLI::Range(0.5f, 0.999f));
-    float scalesLrInit = 0.005f;
+    float scalesLrInit = 0.007f;
     app.add_option("--scales-lr-init", scalesLrInit, "Initial MRNF scales learning rate")
         ->check(CLI::Range(0.0f, 1000000.0f));
-    float scalesLrFinal = 0.00005f;
+    float scalesLrFinal = 0.005f;
     app.add_option("--scales-lr-final", scalesLrFinal, "Final MRNF scales learning rate")
         ->check(CLI::Range(0.0f, 1000000.0f));
     std::vector<float> bgColor = {0.6130f, 0.0101f, 0.3984f};
@@ -254,7 +254,7 @@ int main(int argc, char *argv[]) {
             model.fullIteration(cam, step, gt, ssimWeight, maskPtr);
             model.schedulersStep(step);
             model.applyMaskOpacityPenalty(cams, step);
-            model.afterTrain(step);
+            model.afterTrain(cams, step);
             msplat_commit();
 
             if (step % progressInterval == 0 || step == (size_t)numIters) {

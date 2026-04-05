@@ -38,8 +38,8 @@ struct Config {
     float opacityDecay = 0.004f;
     float scaleDecay = 0.002f;
     float boundsPercentile = 0.8f;
-    float scalesLrInit = 0.005f;
-    float scalesLrFinal = 0.00005f;
+    float scalesLrInit = 0.007f;
+    float scalesLrFinal = 0.005f;
     bool keepCrs = false;
     float downscaleFactor = 1.0f;
     float bgColor[3] = {0.0f, 0.0f, 0.0f};  // black — matches Brush default for masked training

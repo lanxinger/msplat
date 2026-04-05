@@ -71,8 +71,8 @@ static inline MsplatConfig msplat_default_config(void) {
     c.opacityDecay = 0.004f;
     c.scaleDecay = 0.002f;
     c.boundsPercentile = 0.8f;
-    c.scalesLrInit = 0.005f;
-    c.scalesLrFinal = 0.00005f;
+    c.scalesLrInit = 0.007f;
+    c.scalesLrFinal = 0.005f;
     c.keepCrs = false;
     c.downscaleFactor = 1.0f;
     c.bgColor[0] = 0.0f; c.bgColor[1] = 0.0f; c.bgColor[2] = 0.0f;

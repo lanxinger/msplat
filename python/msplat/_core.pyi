@@ -45,7 +45,7 @@ class TrainingConfig:
         ssim_weight: float = 0.2,
         num_downscales: int = 2,
         resolution_schedule: int = 3000,
-        refine_every: int = 100,
+        refine_every: int = 200,
         warmup_length: int = 500,
         reset_alpha_every: int = 30,
         densify_grad_thresh: float = 0.0002,
@@ -68,8 +68,8 @@ class TrainingConfig:
         opacity_decay: float = 0.004,
         scale_decay: float = 0.002,
         bounds_percentile: float = 0.8,
-        scales_lr_init: float = 0.005,
-        scales_lr_final: float = 0.00005,
+        scales_lr_init: float = 0.007,
+        scales_lr_final: float = 0.005,
     ) -> None: ...
 
 class TrainingStats:

@@ -42,7 +42,7 @@ struct TrainingConfig {
     float ssim_weight = 0.2f;
     int num_downscales = 2;
     int resolution_schedule = 3000;
-    int refine_every = 100;
+    int refine_every = 200;
     int warmup_length = 500;
     int reset_alpha_every = 30;
     float densify_grad_thresh = 0.0002f;
@@ -52,7 +52,7 @@ struct TrainingConfig {
     float mean_noise_weight = 50.0f;
     int noise_stop_at = 15000;
     std::string strategy = "classic";
-    int max_splats = 0;
+    int max_splats = 1000000;
     float hybrid_growth_floor_divisor = 33.0f;
     float growth_grad_threshold = 0.003f;
     float grow_fraction = 0.07f;
@@ -60,8 +60,8 @@ struct TrainingConfig {
     float opacity_decay = 0.004f;
     float scale_decay = 0.002f;
     float bounds_percentile = 0.8f;
-    float scales_lr_init = 0.005f;
-    float scales_lr_final = 0.00005f;
+    float scales_lr_init = 0.007f;
+    float scales_lr_final = 0.005f;
     bool keep_crs = false;
     float downscale_factor = 1.0f;
     std::string output = "splat.ply";
@@ -185,7 +185,7 @@ public:
         model->fullIteration(cam, current_step, gt, config.ssim_weight, maskPtr);
         model->schedulersStep(current_step);
         model->applyMaskOpacityPenalty(dataset_ptr->train_cams, current_step);
-        model->afterTrain(current_step);
+        model->afterTrain(dataset_ptr->train_cams, current_step);
         msplat_commit();
 
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -381,7 +381,7 @@ NB_MODULE(_core, m) {
             "ssim_weight"_a = 0.2f,
             "num_downscales"_a = 2,
             "resolution_schedule"_a = 3000,
-            "refine_every"_a = 100,
+            "refine_every"_a = 200,
             "warmup_length"_a = 500,
             "reset_alpha_every"_a = 30,
             "densify_grad_thresh"_a = 0.0002f,
@@ -396,7 +396,7 @@ NB_MODULE(_core, m) {
             "mean_noise_weight"_a = 50.0f,
             "noise_stop_at"_a = 15000,
             "strategy"_a = "classic",
-            "max_splats"_a = 0,
+            "max_splats"_a = 1000000,
             "hybrid_growth_floor_divisor"_a = 33.0f,
             "growth_grad_threshold"_a = 0.003f,
             "grow_fraction"_a = 0.07f,
@@ -404,8 +404,8 @@ NB_MODULE(_core, m) {
             "opacity_decay"_a = 0.004f,
             "scale_decay"_a = 0.002f,
             "bounds_percentile"_a = 0.8f,
-            "scales_lr_init"_a = 0.005f,
-            "scales_lr_final"_a = 0.00005f)
+            "scales_lr_init"_a = 0.007f,
+            "scales_lr_final"_a = 0.005f)
         .def_rw("iterations", &TrainingConfig::iterations)
         .def_rw("sh_degree", &TrainingConfig::sh_degree)
         .def_rw("sh_degree_interval", &TrainingConfig::sh_degree_interval)

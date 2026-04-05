@@ -28,7 +28,7 @@ def test_training_config_defaults():
     assert cfg.sh_degree == 3
     assert cfg.ssim_weight == pytest.approx(0.2)
     assert cfg.strategy == "classic"
-    assert cfg.refine_every == 100
+    assert cfg.refine_every == 200
     assert cfg.warmup_length == 500
 
 
