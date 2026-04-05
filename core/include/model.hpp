@@ -9,12 +9,22 @@ int numShBases(int degree);
 float psnr(const MTensor& rendered, const MTensor& gt, const MTensor* mask = nullptr);
 float l1_loss(const MTensor& rendered, const MTensor& gt, const MTensor* mask = nullptr);
 
+enum class Strategy {
+  Classic = 0,
+  Hybrid = 1,
+  MRNF = 2,
+  IGSPlus = 3,
+};
+
 struct Model{
   Model(const InputData &inputData, int numCameras,
         int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
         int refineEvery, int warmupLength, int resetAlphaEvery, float densifyGradThresh, float densifySizeThresh, int stopScreenSizeAt, float splitScreenSize,
         int maxSteps, bool keepCrs, float meanNoiseWeight, int noiseStopAt,
-        bool hybridRefine = false, int maxSplats = 0, float hybridGrowthFloorDivisor = 33.0f,
+        Strategy strategy = Strategy::Classic, int maxSplats = 0, float hybridGrowthFloorDivisor = 33.0f,
+        float growthGradThreshold = 0.003f, float growFraction = 0.07f, int growUntilIter = 15000,
+        float opacityDecay = 0.004f, float scaleDecay = 0.002f, float boundsPercentile = 0.8f,
+        float scalesLrInit = 0.005f, float scalesLrFinal = 0.00005f,
         const float* bgColor = nullptr);
 
   ~Model(){ releaseOptimizers(); }
@@ -42,6 +52,15 @@ struct Model{
   void fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight, MTensor *mask = nullptr);
   MTensor render(Camera& cam, int step);
   void applyMeanNoise(int step);
+  void computeBounds();
+  void computeBudgetSchedule();
+
+  struct SceneBounds {
+    float center[3] = {};
+    float extent[3] = {};
+    float medianSize = 0.0f;
+    float maxExtent = 0.0f;
+  };
 
   MTensor means;
   MTensor scales;
@@ -78,6 +97,8 @@ struct Model{
   MTensor xysGradNorm;
   MTensor visCounts;
   MTensor max2DSize;
+  MTensor refineWeightMax;
+  MTensor errorScoreMax;
 
   MTensor backgroundColor;
   MTensor window2d;  // SSIM window (11,11) f32
@@ -99,9 +120,27 @@ struct Model{
   bool keepCrs;
   float meanNoiseWeight;
   int noiseStopAt;
+  Strategy strategy;
   bool hybridRefine;
   int maxSplats;
   float hybridGrowthFloorDivisor;
+  float growthGradThreshold;
+  float growFraction;
+  int growUntilIter;
+  float opacityDecay;
+  float scaleDecay;
+  float boundsPercentile;
+  SceneBounds bounds;
+  bool boundsValid = false;
+  int refineWindowsSinceBounds = 0;
+  float meansLrUnscaled = 0.0f;
+  float scaleLrCurrent = 0.0f;
+  double meansLrGamma = 1.0;
+  double scaleLrGamma = 1.0;
+  std::vector<int64_t> budgetSchedule;
+  int igsCurrentStep = 0;
+  int igsTotalSteps = 0;
+  int64_t igsInitialPoints = 0;
   bool maskAwareData = false;
 
   float scale;

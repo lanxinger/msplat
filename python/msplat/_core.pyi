@@ -19,9 +19,17 @@ class TrainingConfig:
     split_screen_size: float
     mean_noise_weight: float
     noise_stop_at: int
-    hybrid_refine: bool
+    strategy: str
     max_splats: int
     hybrid_growth_floor_divisor: float
+    growth_grad_threshold: float
+    grow_fraction: float
+    grow_until_iter: int
+    opacity_decay: float
+    scale_decay: float
+    bounds_percentile: float
+    scales_lr_init: float
+    scales_lr_final: float
     keep_crs: bool
     downscale_factor: float
     output: str
@@ -51,9 +59,17 @@ class TrainingConfig:
         bg_color: list[float] = ...,
         mean_noise_weight: float = 50.0,
         noise_stop_at: int = 15000,
-        hybrid_refine: bool = False,
+        strategy: str = "classic",
         max_splats: int = 0,
         hybrid_growth_floor_divisor: float = 33.0,
+        growth_grad_threshold: float = 0.003,
+        grow_fraction: float = 0.07,
+        grow_until_iter: int = 15000,
+        opacity_decay: float = 0.004,
+        scale_decay: float = 0.002,
+        bounds_percentile: float = 0.8,
+        scales_lr_init: float = 0.005,
+        scales_lr_final: float = 0.00005,
     ) -> None: ...
 
 class TrainingStats:

@@ -1,6 +1,9 @@
+#include <algorithm>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <random>
 #include "model.hpp"
@@ -68,6 +71,747 @@ struct FenwickSampler {
     }
 };
 
+namespace {
+
+bool strategyUsesHybridRefine(Strategy strategy) {
+    return strategy == Strategy::Hybrid || strategy == Strategy::MRNF;
+}
+
+inline float sigmoidf(float x) {
+    return 1.0f / (1.0f + std::exp(-x));
+}
+
+inline float logitf(float p) {
+    p = std::clamp(p, 1e-6f, 1.0f - 1e-6f);
+    return std::log(p / (1.0f - p));
+}
+
+void expandVisCountsToActive(Model &model) {
+    if (!model.visCounts.defined()) return;
+    if (model.visCounts.size(0) >= model.num_active) return;
+    int old_n = (int)model.visCounts.size(0);
+    MTensor expanded = gpu_zeros({model.num_active}, DType::Float32);
+    memcpy(expanded.data_ptr(), model.visCounts.data_ptr(), old_n * sizeof(float));
+    model.visCounts = std::move(expanded);
+}
+
+void schedulersStepClassicOrHybrid(Model &model, int step) {
+    float t = std::clamp((float)step / (float)model.maxSteps, 0.f, 1.f);
+    model.adam_lr[0] = std::exp(std::log(model.means_lr_init) * (1.f - t)
+                              + std::log(model.means_lr_final) * t);
+}
+
+void afterTrainClassicOrHybrid(Model &model, int step) {
+    if (!model.radii.defined()) return;
+
+    if (step % model.refineEvery == 0 && step > model.warmupLength){
+        int resetInterval = model.resetAlphaEvery * model.refineEvery;
+        bool doDensification = step < model.stopSplitAt
+                            && step % resetInterval > model.numCameras + model.refineEvery;
+
+        if (doDensification){
+            int numPointsBefore = model.num_active;
+            model.ensureCapacity(3 * model.num_active);  // worst case: every gaussian splits
+
+            // Fill random samples for splits (CPU randn, shared memory)
+            {
+                std::mt19937 rng(step);
+                std::normal_distribution<float> dist(0.0f, 1.0f);
+                float *p = model.densify_random_samples.data<float>();
+                for (int64_t i = 0; i < 2 * model.num_active * 3; i++) p[i] = dist(rng);
+            }
+
+            float half_max_dim = 0.5f * static_cast<float>((std::max)(model.lastWidth, model.lastHeight));
+            int check_screen = (step < model.stopScreenSizeAt) ? 1 : 0;
+            bool checkHuge = step > model.refineEvery * model.resetAlphaEvery;
+            int fr_stride = (int)model.featuresRest_buf.stride0();
+
+            // In hybrid mode, save pre-compact stats BEFORE densify:
+            // 1. Count above-threshold splats (for adaptive growth budget)
+            // 2. Save visCounts + gradient norms (for two-CDF donor sampling)
+            int aboveThreshCount = 0;
+            std::vector<float> savedVisCounts;
+            std::vector<float> savedGradWeights;  // per-splat avg gradient norm
+            if (model.hybridRefine && model.xysGradNorm.defined() && model.visCounts.defined()) {
+                msplat_gpu_sync();
+                const float *gn = model.xysGradNorm.data<float>();
+                const float *vc = model.visCounts.data<float>();
+                savedVisCounts.assign(vc, vc + model.num_active);
+                savedGradWeights.resize(model.num_active);
+                for (int i = 0; i < model.num_active; i++) {
+                    float avg_grad = (vc[i] > 0) ? (gn[i] / vc[i]) * half_max_dim : 0.0f;
+                    savedGradWeights[i] = avg_grad;
+                    if (avg_grad > model.densifyGradThresh)
+                        aboveThreshCount++;
+                }
+            }
+
+            // Brush prune threshold: opacity < 1/255 (vs classic 3DGS's 0.1)
+            float cullAlpha = model.hybridRefine ? (1.0f / 255.0f) : 0.1f;
+
+            int new_count = msplat_densify(
+                model.num_active, model.buf_capacity,
+                model.densifyGradThresh, model.densifySizeThresh, model.splitScreenSize, check_screen,
+                cullAlpha, 0.5f, 0.15f, checkHuge ? 1 : 0,
+                model.xysGradNorm, model.visCounts, model.max2DSize, half_max_dim,
+                model.means_buf, model.scales_buf, model.quats_buf,
+                model.featuresDc_buf, model.featuresRest_buf, model.opacities_buf, fr_stride,
+                model.adam_exp_avg_buf, model.adam_exp_avg_sq_buf,
+                model.densify_split_flag, model.densify_dup_flag,
+                model.densify_split_prefix, model.densify_dup_prefix,
+                model.densify_keep_flag, model.densify_keep_prefix,
+                model.densify_block_totals, model.densify_compact_scratch,
+                model.densify_random_samples,
+                model.hybridRefine ? 1 : 0
+            );
+
+            model.num_active = new_count;
+            model.refreshViews();
+
+            if (model.hybridRefine && model.num_active > 0) {
+                int freed = std::max(0, numPointsBefore - model.num_active);
+                static constexpr float GROWTH_SELECT_FRACTION = 0.2f;
+                int grad_growth = (int)(aboveThreshCount * GROWTH_SELECT_FRACTION + 0.5f);
+                int min_growth = 0;
+                if (model.hybridGrowthFloorDivisor > 0.0f)
+                    min_growth = (int)(model.num_active / model.hybridGrowthFloorDivisor);
+                int growth = std::max(grad_growth, min_growth);
+                int budget = freed + growth;
+                if (model.maxSplats > 0)
+                    budget = std::min(budget, std::max(0, model.maxSplats - model.num_active));
+                budget = std::min(budget, model.num_active);
+
+                if (budget > 0) {
+                    int worst_case = 3 * numPointsBefore;
+                    const int32_t *kf = model.densify_keep_flag.data<int32_t>();
+                    const int32_t *kp = model.densify_keep_prefix.data<int32_t>();
+                    std::vector<float> compactVis(model.num_active, 0.0f);
+                    std::vector<float> compactGrad(model.num_active, 0.0f);
+                    if (!savedVisCounts.empty()) {
+                        int N_old = numPointsBefore;
+                        for (int i = 0; i < worst_case && i < model.buf_capacity; i++) {
+                            if (kf[i] == 0) continue;
+                            int dst_idx = kp[i] - 1;
+                            if (dst_idx < 0 || dst_idx >= model.num_active) continue;
+                            if (i < N_old) {
+                                compactVis[dst_idx] = savedVisCounts[i];
+                                compactGrad[dst_idx] = savedGradWeights[i];
+                            }
+                        }
+                        const int32_t *sf = model.densify_split_flag.data<int32_t>();
+                        const int32_t *sp = model.densify_split_prefix.data<int32_t>();
+                        for (int i = 0; i < N_old; i++) {
+                            if (sf[i] == 0) continue;
+                            int ord = sp[i] - 1;
+                            for (int k = 0; k < 2; k++) {
+                                int child = N_old + 2 * ord + k;
+                                if (child >= worst_case || child >= model.buf_capacity) continue;
+                                if (kf[child] == 0) continue;
+                                int dst_idx = kp[child] - 1;
+                                if (dst_idx >= 0 && dst_idx < model.num_active) {
+                                    compactVis[dst_idx] = savedVisCounts[i];
+                                    compactGrad[dst_idx] = savedGradWeights[i];
+                                }
+                            }
+                        }
+                    }
+
+                    model.ensureCapacity(model.num_active + budget);
+                    fr_stride = (int)model.featuresRest_buf.stride0();
+                    float *op = model.opacities_buf.data<float>();
+
+                    std::vector<double> weights(model.num_active);
+                    for (int i = 0; i < model.num_active; i++) {
+                        double sig = 1.0 / (1.0 + std::exp(-(double)op[i]));
+                        double vis = (compactVis[i] > 0) ? 1.0 : 0.0;
+                        weights[i] = sig * vis;
+                    }
+                    FenwickSampler sampler;
+                    sampler.build(weights.data(), model.num_active);
+
+                    std::vector<int32_t> donorIndices(budget);
+                    std::vector<float> rndSamples(budget * 3);
+                    int recycled = 0;
+
+                    double running = sampler.total();
+                    if (running > 0) {
+                        std::mt19937 rng(step ^ 0xDEADBEEFu);
+                        std::uniform_real_distribution<double> uni(0.0, 1.0);
+                        std::normal_distribution<float> randn(0.0f, 1.0f);
+
+                        for (int d = 0; d < budget; d++) {
+                            running = sampler.total();
+                            if (running <= 0) break;
+                            int c = sampler.draw(uni(rng) * running);
+                            donorIndices[recycled] = c;
+                            rndSamples[recycled*3]   = randn(rng);
+                            rndSamples[recycled*3+1] = randn(rng);
+                            rndSamples[recycled*3+2] = randn(rng);
+                            recycled++;
+                        }
+                    }
+
+                    if (recycled > 0) {
+                        MTensor donorBuf = gpu_empty({(int64_t)recycled}, DType::Int32);
+                        memcpy(donorBuf.data_ptr(), donorIndices.data(), recycled * sizeof(int32_t));
+                        memcpy(model.densify_random_samples.data_ptr(), rndSamples.data(), recycled * 3 * sizeof(float));
+
+                        msplat_hybrid_refine(
+                            model.num_active, recycled, fr_stride,
+                            donorBuf, model.densify_random_samples,
+                            model.means_buf, model.scales_buf, model.quats_buf,
+                            model.featuresDc_buf, model.featuresRest_buf, model.opacities_buf,
+                            model.adam_exp_avg_buf, model.adam_exp_avg_sq_buf
+                        );
+                    }
+
+                    model.num_active += recycled;
+                    model.refreshViews();
+                }
+            }
+
+            std::cout << "Densified: " << numPointsBefore << " -> " << model.num_active << " gaussians"
+                      << (model.hybridRefine ? " (hybrid)" : "") << std::endl;
+        }
+
+        if (!model.hybridRefine && !model.maskAwareData
+            && step < model.stopSplitAt && step % resetInterval == model.refineEvery){
+            msplat_gpu_sync();
+            constexpr float resetLogit = -1.3862943611198906f;
+            float *op = model.opacities.data<float>();
+            for (int64_t i = 0; i < model.opacities.numel(); i++)
+                if (op[i] > resetLogit) op[i] = resetLogit;
+
+            model.adam_exp_avg[5].zero();
+            model.adam_exp_avg_sq[5].zero();
+            fprintf(stderr, "Opacity reset at step %d\n", step);
+        }
+
+        model.xysGradNorm.reset();
+        model.visCounts.reset();
+        model.max2DSize.reset();
+    }
+
+    if (model.hybridRefine && step > model.warmupLength && step % model.refineEvery == 0) {
+        msplat_gpu_sync();
+        static constexpr float OPAC_DECAY = 0.004f;
+        static constexpr float SCALE_DECAY = 0.002f;
+        static constexpr float MIN_OPACITY = 1.0f / 255.0f;
+        float train_t = std::clamp((float)step / (float)model.maxSteps, 0.0f, 1.0f);
+        float shrink_strength = 1.0f - train_t;
+        float minus_opac = OPAC_DECAY * shrink_strength;
+        float scale_factor = 1.0f - SCALE_DECAY * shrink_strength;
+
+        float *op = model.opacities.data<float>();
+        float *sc = model.scales.data<float>();
+        int n = model.num_active;
+
+        if (minus_opac > 0 || scale_factor < 1.0f) {
+            float log_sf = std::log(scale_factor);
+            for (int i = 0; i < n; i++) {
+                float sig = 1.0f / (1.0f + std::exp(-op[i]));
+                float new_sig = std::clamp(sig - minus_opac, 1e-6f, 1.0f - 1e-6f);
+                op[i] = std::log(new_sig / (1.0f - new_sig));
+                sc[i*3] += log_sf; sc[i*3+1] += log_sf; sc[i*3+2] += log_sf;
+            }
+        }
+
+        int pre_prune = model.num_active;
+        int dst = 0;
+        float *mn = model.means.data<float>();
+        float *qt = model.quats.data<float>();
+        float *dc = model.featuresDc.data<float>();
+        float *fr = model.featuresRest.data<float>();
+        int fr_stride = (int)model.featuresRest_buf.stride0();
+        int strides[6] = {3, 3, 4, 3, fr_stride, 1};
+        float *param_ptrs[6] = {mn, sc, qt, dc, fr, op};
+        float *adam_ea_ptrs[6], *adam_es_ptrs[6];
+        for (int g = 0; g < Model::N_ADAM_GROUPS; g++) {
+            adam_ea_ptrs[g] = model.adam_exp_avg[g].data<float>();
+            adam_es_ptrs[g] = model.adam_exp_avg_sq[g].data<float>();
+        }
+
+        for (int i = 0; i < n; i++) {
+            float sig = 1.0f / (1.0f + std::exp(-op[i]));
+            float s0 = std::exp(sc[i*3]), s1 = std::exp(sc[i*3+1]), s2 = std::exp(sc[i*3+2]);
+            float max_s = std::max({s0, s1, s2});
+            float min_s = std::min({s0, s1, s2});
+
+            bool dead = sig < MIN_OPACITY || min_s < 1e-10f || max_s > model.scale * 100.0f;
+            if (dead) continue;
+
+            if (dst != i) {
+                for (int g = 0; g < Model::N_ADAM_GROUPS; g++) {
+                    memmove(&param_ptrs[g][dst * strides[g]], &param_ptrs[g][i * strides[g]], strides[g] * sizeof(float));
+                    memmove(&adam_ea_ptrs[g][dst * strides[g]], &adam_ea_ptrs[g][i * strides[g]], strides[g] * sizeof(float));
+                    memmove(&adam_es_ptrs[g][dst * strides[g]], &adam_es_ptrs[g][i * strides[g]], strides[g] * sizeof(float));
+                }
+            }
+            dst++;
+        }
+
+        if (dst < model.num_active) {
+            model.num_active = dst;
+            model.refreshViews();
+        }
+
+        int pruned = pre_prune - model.num_active;
+        if (pruned > 0 && model.num_active > 0) {
+            int budget = std::min(pruned, model.num_active);
+            if (model.maxSplats > 0)
+                budget = std::min(budget, std::max(0, model.maxSplats - model.num_active));
+
+            if (budget > 0) {
+                model.ensureCapacity(model.num_active + budget);
+                fr_stride = (int)model.featuresRest_buf.stride0();
+                op = model.opacities_buf.data<float>();
+
+                std::vector<double> weights(model.num_active);
+                for (int i = 0; i < model.num_active; i++) {
+                    double sig = 1.0 / (1.0 + std::exp(-(double)op[i]));
+                    weights[i] = sig;
+                }
+                FenwickSampler sampler;
+                sampler.build(weights.data(), model.num_active);
+                double running = sampler.total();
+                if (running > 0) {
+                    std::mt19937 rng(step ^ 0xABCD1234u);
+                    std::uniform_real_distribution<double> uni(0.0, 1.0);
+                    std::normal_distribution<float> randn(0.0f, 1.0f);
+                    std::vector<int32_t> donorIdx(budget);
+                    std::vector<float> rndBuf(budget * 3);
+                    int recycled = 0;
+
+                    for (int d = 0; d < budget; d++) {
+                        running = sampler.total();
+                        if (running <= 0) break;
+                        int c = sampler.draw(uni(rng) * running);
+                        donorIdx[recycled] = c;
+                        rndBuf[recycled*3]   = randn(rng);
+                        rndBuf[recycled*3+1] = randn(rng);
+                        rndBuf[recycled*3+2] = randn(rng);
+                        recycled++;
+                    }
+
+                    if (recycled > 0) {
+                        MTensor donorBuf = gpu_empty({(int64_t)recycled}, DType::Int32);
+                        memcpy(donorBuf.data_ptr(), donorIdx.data(), recycled * sizeof(int32_t));
+                        memcpy(model.densify_random_samples.data_ptr(), rndBuf.data(), recycled * 3 * sizeof(float));
+                        msplat_hybrid_refine(
+                            model.num_active, recycled, fr_stride,
+                            donorBuf, model.densify_random_samples,
+                            model.means_buf, model.scales_buf, model.quats_buf,
+                            model.featuresDc_buf, model.featuresRest_buf, model.opacities_buf,
+                            model.adam_exp_avg_buf, model.adam_exp_avg_sq_buf
+                        );
+                        model.num_active += recycled;
+                        model.refreshViews();
+                    }
+                }
+            }
+        }
+    }
+}
+
+int compactActiveMRNF(Model &model) {
+    int pre_prune = model.num_active;
+    if (pre_prune <= 0) return 0;
+
+    float min_opacity = 1.0f / 255.0f;
+    float scale_limit = model.boundsValid ? model.bounds.maxExtent * 100.0f : model.scale * 100.0f;
+    float dist_limit = model.boundsValid ? model.bounds.maxExtent * 100.0f : std::numeric_limits<float>::infinity();
+
+    float *mn = model.means.data<float>();
+    float *sc = model.scales.data<float>();
+    float *qt = model.quats.data<float>();
+    float *dc = model.featuresDc.data<float>();
+    float *fr = model.featuresRest.data<float>();
+    float *op = model.opacities.data<float>();
+    float *vw = model.visCounts.defined() ? model.visCounts.data<float>() : nullptr;
+    float *rw = model.refineWeightMax.defined() ? model.refineWeightMax.data<float>() : nullptr;
+    int fr_stride = (int)model.featuresRest_buf.stride0();
+
+    int param_strides[6] = {3, 3, 4, 3, fr_stride, 1};
+    float *param_ptrs[6] = {mn, sc, qt, dc, fr, op};
+    float *adam_ea_ptrs[Model::N_ADAM_GROUPS], *adam_es_ptrs[Model::N_ADAM_GROUPS];
+    for (int g = 0; g < Model::N_ADAM_GROUPS; ++g) {
+        adam_ea_ptrs[g] = model.adam_exp_avg[g].data<float>();
+        adam_es_ptrs[g] = model.adam_exp_avg_sq[g].data<float>();
+    }
+
+    int dst = 0;
+    for (int i = 0; i < pre_prune; ++i) {
+        float sig = sigmoidf(op[i]);
+        float sx = std::exp(sc[i*3]);
+        float sy = std::exp(sc[i*3+1]);
+        float sz = std::exp(sc[i*3+2]);
+        float min_s = std::min({sx, sy, sz});
+        float max_s = std::max({sx, sy, sz});
+        float dx = mn[i*3] - model.bounds.center[0];
+        float dy = mn[i*3+1] - model.bounds.center[1];
+        float dz = mn[i*3+2] - model.bounds.center[2];
+        float dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+
+        bool dead = sig < min_opacity
+                 || min_s < 1e-10f
+                 || max_s > scale_limit
+                 || dist > dist_limit;
+        if (dead) continue;
+
+        if (dst != i) {
+            for (int g = 0; g < Model::N_ADAM_GROUPS; ++g) {
+                memmove(&param_ptrs[g][dst * param_strides[g]], &param_ptrs[g][i * param_strides[g]], param_strides[g] * sizeof(float));
+                memmove(&adam_ea_ptrs[g][dst * param_strides[g]], &adam_ea_ptrs[g][i * param_strides[g]], param_strides[g] * sizeof(float));
+                memmove(&adam_es_ptrs[g][dst * param_strides[g]], &adam_es_ptrs[g][i * param_strides[g]], param_strides[g] * sizeof(float));
+            }
+            if (vw) vw[dst] = vw[i];
+            if (rw) rw[dst] = rw[i];
+        }
+        dst++;
+    }
+
+    if (dst < model.num_active) {
+        model.num_active = dst;
+        model.refreshViews();
+    }
+    return pre_prune - model.num_active;
+}
+
+void afterTrainMRNF(Model &model, int step) {
+    if (!model.radii.defined()) return;
+    if (step % model.refineEvery != 0 || step <= model.warmupLength) return;
+    if (!model.xysGradNorm.defined() || !model.visCounts.defined()) return;
+
+    msplat_gpu_sync();
+
+    float half_max_dim = 0.5f * static_cast<float>((std::max)(model.lastWidth, model.lastHeight));
+    float *refine = model.refineWeightMax.defined() ? model.refineWeightMax.data<float>() : nullptr;
+    const float *gn = model.xysGradNorm.data<float>();
+    const float *vc = model.visCounts.data<float>();
+    if (!refine) return;
+
+    for (int i = 0; i < model.num_active; ++i) {
+        float avg_grad = (vc[i] > 0.0f) ? (gn[i] / vc[i]) * half_max_dim : 0.0f;
+        refine[i] = std::max(refine[i], avg_grad);
+    }
+
+    if (!model.boundsValid || model.refineWindowsSinceBounds >= 5) {
+        model.computeBounds();
+        model.refineWindowsSinceBounds = 0;
+    } else {
+        model.refineWindowsSinceBounds++;
+    }
+
+    int pruned_count = compactActiveMRNF(model);
+
+    float *op = model.opacities.data<float>();
+    float *vis = model.visCounts.defined() ? model.visCounts.data<float>() : nullptr;
+    float *weights_max = model.refineWeightMax.defined() ? model.refineWeightMax.data<float>() : nullptr;
+
+    if (step < model.growUntilIter && model.num_active > 0 && vis && weights_max) {
+        int capacity_budget = (model.maxSplats > 0) ? std::max(0, model.maxSplats - model.num_active) : model.num_active;
+        int replacement = std::min({pruned_count, capacity_budget, model.num_active});
+
+        int above_threshold_count = 0;
+        for (int i = 0; i < model.num_active; ++i) {
+            if (vis[i] > 0.0f && weights_max[i] > model.growthGradThreshold)
+                above_threshold_count++;
+        }
+
+        int total_growth = (int)std::lround((double)above_threshold_count * (double)model.growFraction);
+        int growth = std::max(0, total_growth - replacement);
+        growth = std::min(growth, std::max(0, capacity_budget - replacement));
+        growth = std::min(growth, std::max(0, model.num_active - replacement));
+
+        int total_splits = replacement + growth;
+        if (total_splits > 0) {
+            std::vector<int32_t> donors(total_splits);
+            std::vector<uint8_t> chosen(model.num_active, 0);
+            int selected = 0;
+
+            if (replacement > 0) {
+                std::vector<double> repl_weights(model.num_active, 0.0);
+                for (int i = 0; i < model.num_active; ++i)
+                    repl_weights[i] = (vis[i] > 0.0f) ? sigmoidf(op[i]) : 0.0f;
+                FenwickSampler sampler;
+                sampler.build(repl_weights.data(), model.num_active);
+                std::mt19937 rng(step ^ 0x13579BDFu);
+                std::uniform_real_distribution<double> uni(0.0, 1.0);
+                for (int i = 0; i < replacement; ++i) {
+                    double total = sampler.total();
+                    if (total <= 0.0) break;
+                    int idx = sampler.draw(uni(rng) * total);
+                    donors[selected++] = idx;
+                    chosen[idx] = 1;
+                }
+            }
+
+            if (growth > 0) {
+                std::vector<double> grow_weights(model.num_active, 0.0);
+                for (int i = 0; i < model.num_active; ++i) {
+                    if (!chosen[i] && vis[i] > 0.0f && weights_max[i] > model.growthGradThreshold)
+                        grow_weights[i] = weights_max[i];
+                }
+                FenwickSampler sampler;
+                sampler.build(grow_weights.data(), model.num_active);
+                std::mt19937 rng(step ^ 0x2468ACE0u);
+                std::uniform_real_distribution<double> uni(0.0, 1.0);
+                for (int i = 0; i < growth; ++i) {
+                    double total = sampler.total();
+                    if (total <= 0.0) break;
+                    int idx = sampler.draw(uni(rng) * total);
+                    donors[selected++] = idx;
+                    chosen[idx] = 1;
+                }
+            }
+
+            if (selected > 0) {
+                model.ensureCapacity(model.num_active + selected);
+                MTensor donor_buf = gpu_empty({(int64_t)selected}, DType::Int32);
+                memcpy(donor_buf.data_ptr(), donors.data(), selected * sizeof(int32_t));
+                int fr_stride = (int)model.featuresRest_buf.stride0();
+                msplat_long_axis_split(
+                    selected, model.num_active, fr_stride,
+                    donor_buf,
+                    model.means_buf, model.scales_buf, model.quats_buf,
+                    model.featuresDc_buf, model.featuresRest_buf, model.opacities_buf,
+                    model.adam_exp_avg_buf, model.adam_exp_avg_sq_buf
+                );
+                model.num_active += selected;
+                model.refreshViews();
+                expandVisCountsToActive(model);
+            }
+        }
+    }
+
+    msplat_gpu_sync();
+    static constexpr float MIN_OPACITY = 1.0f / 255.0f;
+    float train_t = std::clamp((float)step / (float)model.maxSteps, 0.0f, 1.0f);
+    float shrink_strength = 1.0f - train_t;
+    float minus_opac = model.opacityDecay * shrink_strength;
+    float scale_factor = 1.0f - model.scaleDecay * shrink_strength;
+    op = model.opacities.data<float>();
+    float *sc = model.scales.data<float>();
+
+    if (minus_opac > 0.0f || scale_factor < 1.0f) {
+        float log_sf = std::log(std::max(scale_factor, 1e-6f));
+        for (int i = 0; i < model.num_active; ++i) {
+            float sig = sigmoidf(op[i]);
+            float new_sig = std::clamp(sig - minus_opac, 1e-6f, 1.0f - 1e-6f);
+            op[i] = logitf(new_sig);
+            sc[i*3] += log_sf;
+            sc[i*3+1] += log_sf;
+            sc[i*3+2] += log_sf;
+        }
+    }
+
+    int pruned_after_decay = compactActiveMRNF(model);
+    if (pruned_after_decay > 0 && model.num_active > 0) {
+        int budget = std::min(pruned_after_decay, model.num_active);
+        if (model.maxSplats > 0)
+            budget = std::min(budget, std::max(0, model.maxSplats - model.num_active));
+
+        if (budget > 0) {
+            std::vector<double> recycle_weights(model.num_active, 0.0);
+            op = model.opacities.data<float>();
+            for (int i = 0; i < model.num_active; ++i)
+                recycle_weights[i] = sigmoidf(op[i]);
+            FenwickSampler sampler;
+            sampler.build(recycle_weights.data(), model.num_active);
+            std::vector<int32_t> donors(budget);
+            std::mt19937 rng(step ^ 0xA55A1234u);
+            std::uniform_real_distribution<double> uni(0.0, 1.0);
+            int selected = 0;
+            for (int i = 0; i < budget; ++i) {
+                double total = sampler.total();
+                if (total <= 0.0) break;
+                donors[selected++] = sampler.draw(uni(rng) * total);
+            }
+
+            if (selected > 0) {
+                model.ensureCapacity(model.num_active + selected);
+                MTensor donor_buf = gpu_empty({(int64_t)selected}, DType::Int32);
+                memcpy(donor_buf.data_ptr(), donors.data(), selected * sizeof(int32_t));
+                int fr_stride = (int)model.featuresRest_buf.stride0();
+                msplat_long_axis_split(
+                    selected, model.num_active, fr_stride,
+                    donor_buf,
+                    model.means_buf, model.scales_buf, model.quats_buf,
+                    model.featuresDc_buf, model.featuresRest_buf, model.opacities_buf,
+                    model.adam_exp_avg_buf, model.adam_exp_avg_sq_buf
+                );
+                model.num_active += selected;
+                model.refreshViews();
+                expandVisCountsToActive(model);
+            }
+        }
+    }
+
+    if (model.boundsValid && model.meanNoiseWeight > 0.0f
+        && (model.noiseStopAt <= 0 || step < model.noiseStopAt)) {
+        msplat_apply_mean_noise(
+            model.num_active,
+            model.meanNoiseWeight,
+            model.adam_lr[0],
+            model.means,
+            model.scales,
+            model.quats,
+            model.opacities,
+            model.radii,
+            model.visCounts.defined() ? &model.visCounts : nullptr,
+            model.bounds.medianSize,
+            (uint32_t)(step ^ 0x9E3779B9u)
+        );
+    }
+
+    if (model.refineWeightMax.defined()) model.refineWeightMax.zero();
+    model.xysGradNorm.reset();
+    model.visCounts.reset();
+    model.max2DSize.reset();
+}
+
+int compactActiveIGSPlus(Model &model) {
+    int pre_prune = model.num_active;
+    if (pre_prune <= 0) return 0;
+
+    float *mn = model.means.data<float>();
+    float *sc = model.scales.data<float>();
+    float *qt = model.quats.data<float>();
+    float *dc = model.featuresDc.data<float>();
+    float *fr = model.featuresRest.data<float>();
+    float *op = model.opacities.data<float>();
+    float *err = model.errorScoreMax.defined() ? model.errorScoreMax.data<float>() : nullptr;
+    int fr_stride = (int)model.featuresRest_buf.stride0();
+
+    int param_strides[6] = {3, 3, 4, 3, fr_stride, 1};
+    float *param_ptrs[6] = {mn, sc, qt, dc, fr, op};
+    float *adam_ea_ptrs[Model::N_ADAM_GROUPS], *adam_es_ptrs[Model::N_ADAM_GROUPS];
+    for (int g = 0; g < Model::N_ADAM_GROUPS; ++g) {
+        adam_ea_ptrs[g] = model.adam_exp_avg[g].data<float>();
+        adam_es_ptrs[g] = model.adam_exp_avg_sq[g].data<float>();
+    }
+
+    int dst = 0;
+    for (int i = 0; i < pre_prune; ++i) {
+        float sig = sigmoidf(op[i]);
+        float sx = std::exp(sc[i*3]);
+        float sy = std::exp(sc[i*3+1]);
+        float sz = std::exp(sc[i*3+2]);
+        float max_s = std::max({sx, sy, sz});
+        bool dead = sig < 0.005f || max_s > 0.1f;
+        if (dead) continue;
+
+        if (dst != i) {
+            for (int g = 0; g < Model::N_ADAM_GROUPS; ++g) {
+                memmove(&param_ptrs[g][dst * param_strides[g]], &param_ptrs[g][i * param_strides[g]], param_strides[g] * sizeof(float));
+                memmove(&adam_ea_ptrs[g][dst * param_strides[g]], &adam_ea_ptrs[g][i * param_strides[g]], param_strides[g] * sizeof(float));
+                memmove(&adam_es_ptrs[g][dst * param_strides[g]], &adam_es_ptrs[g][i * param_strides[g]], param_strides[g] * sizeof(float));
+            }
+            if (err) err[dst] = err[i];
+        }
+        dst++;
+    }
+
+    if (dst < model.num_active) {
+        model.num_active = dst;
+        model.refreshViews();
+    }
+    return pre_prune - model.num_active;
+}
+
+void afterTrainIGSPlus(Model &model, int step) {
+    if (!model.radii.defined()) return;
+    if (step % model.refineEvery != 0 || step <= model.warmupLength) return;
+
+    if (model.errorScoreMax.defined() && model.xysGradNorm.defined() && model.visCounts.defined()) {
+        msplat_gpu_sync();
+        float half_max_dim = 0.5f * static_cast<float>((std::max)(model.lastWidth, model.lastHeight));
+        const float *gn = model.xysGradNorm.data<float>();
+        const float *vc = model.visCounts.data<float>();
+        float *err = model.errorScoreMax.data<float>();
+        for (int i = 0; i < model.num_active; ++i) {
+            float avg_grad = (vc[i] > 0.0f) ? (gn[i] / vc[i]) * half_max_dim : 0.0f;
+            err[i] = std::max(err[i], avg_grad);
+        }
+    }
+
+    if (step < model.stopSplitAt) {
+        if (model.igsCurrentStep < model.igsTotalSteps && model.num_active > 0) {
+            int64_t budget = model.budgetSchedule.empty()
+                           ? model.num_active
+                           : model.budgetSchedule[std::min((int)model.budgetSchedule.size() - 1, model.igsCurrentStep + 1)];
+            int budget_for_alloc = (int)std::max<int64_t>(0, budget - model.num_active);
+            if (budget_for_alloc > 0 && model.errorScoreMax.defined()) {
+                float *err = model.errorScoreMax.data<float>();
+                std::vector<float> positives;
+                positives.reserve(model.num_active);
+                for (int i = 0; i < model.num_active; ++i)
+                    if (err[i] > 0.0f) positives.push_back(err[i]);
+
+                float median = 1.0f;
+                if (!positives.empty()) {
+                    size_t mid = positives.size() / 2;
+                    std::nth_element(positives.begin(), positives.begin() + mid, positives.end());
+                    median = std::max(positives[mid], 1e-6f);
+                }
+
+                std::vector<double> weights(model.num_active, 0.0);
+                for (int i = 0; i < model.num_active; ++i)
+                    weights[i] = std::max(0.0f, err[i] / median);
+
+                FenwickSampler sampler;
+                sampler.build(weights.data(), model.num_active);
+                std::vector<int32_t> donors(budget_for_alloc);
+                std::mt19937 rng(step ^ 0xBADC0FFEu);
+                std::uniform_real_distribution<double> uni(0.0, 1.0);
+                int selected = 0;
+                for (int i = 0; i < budget_for_alloc; ++i) {
+                    double total = sampler.total();
+                    if (total <= 0.0) break;
+                    donors[selected++] = sampler.draw(uni(rng) * total);
+                }
+
+                if (selected > 0) {
+                    model.ensureCapacity(model.num_active + selected);
+                    MTensor donor_buf = gpu_empty({(int64_t)selected}, DType::Int32);
+                    memcpy(donor_buf.data_ptr(), donors.data(), selected * sizeof(int32_t));
+                    int fr_stride = (int)model.featuresRest_buf.stride0();
+                    msplat_long_axis_split(
+                        selected, model.num_active, fr_stride,
+                        donor_buf,
+                        model.means_buf, model.scales_buf, model.quats_buf,
+                        model.featuresDc_buf, model.featuresRest_buf, model.opacities_buf,
+                        model.adam_exp_avg_buf, model.adam_exp_avg_sq_buf
+                    );
+                    model.num_active += selected;
+                    model.refreshViews();
+                }
+            }
+        }
+
+        compactActiveIGSPlus(model);
+        model.igsCurrentStep++;
+    }
+
+    int resetInterval = model.resetAlphaEvery * model.refineEvery;
+    if (resetInterval > 0 && step % resetInterval == 0) {
+        msplat_gpu_sync();
+        float resetLogit = logitf(0.1f);
+        float *op = model.opacities.data<float>();
+        for (int i = 0; i < model.num_active; ++i)
+            if (op[i] > resetLogit) op[i] = resetLogit;
+        model.adam_exp_avg[5].zero();
+        model.adam_exp_avg_sq[5].zero();
+    }
+
+    if (model.errorScoreMax.defined()) model.errorScoreMax.zero();
+    model.xysGradNorm.reset();
+    model.visCounts.reset();
+    model.max2DSize.reset();
+}
+
+}  // namespace
+
 
 static const double C0 = 0.28209479177387814;
 
@@ -121,7 +865,10 @@ Model::Model(const InputData &inputData, int numCameras,
     int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
     int refineEvery, int warmupLength, int resetAlphaEvery, float densifyGradThresh, float densifySizeThresh, int stopScreenSizeAt, float splitScreenSize,
     int maxSteps, bool keepCrs, float meanNoiseWeight, int noiseStopAt,
-    bool hybridRefine, int maxSplats, float hybridGrowthFloorDivisor,
+    Strategy strategy, int maxSplats, float hybridGrowthFloorDivisor,
+    float growthGradThreshold, float growFraction, int growUntilIter,
+    float opacityDecay, float scaleDecay, float boundsPercentile,
+    float scalesLrInit, float scalesLrFinal,
     const float* bgColor)
     : numCameras(numCameras), numDownscales(numDownscales), resolutionSchedule(resolutionSchedule),
       shDegree(shDegree), shDegreeInterval(shDegreeInterval),
@@ -129,8 +876,16 @@ Model::Model(const InputData &inputData, int numCameras,
       stopSplitAt(maxSteps / 2), densifyGradThresh(densifyGradThresh), densifySizeThresh(densifySizeThresh),
       stopScreenSizeAt(stopScreenSizeAt), splitScreenSize(splitScreenSize),
       maxSteps(maxSteps), keepCrs(keepCrs), meanNoiseWeight(meanNoiseWeight), noiseStopAt(noiseStopAt),
-      hybridRefine(hybridRefine), maxSplats(maxSplats),
-      hybridGrowthFloorDivisor(hybridGrowthFloorDivisor) {
+      strategy(strategy), hybridRefine(strategyUsesHybridRefine(strategy)), maxSplats(maxSplats),
+      hybridGrowthFloorDivisor(hybridGrowthFloorDivisor),
+      growthGradThreshold(growthGradThreshold), growFraction(growFraction), growUntilIter(growUntilIter),
+      opacityDecay(opacityDecay), scaleDecay(scaleDecay), boundsPercentile(boundsPercentile),
+      scaleLrCurrent(scalesLrInit),
+      scaleLrGamma((scalesLrInit > 0.0f && scalesLrFinal > 0.0f)
+            ? std::pow((double)scalesLrFinal / (double)scalesLrInit, 1.0 / std::max(1, maxSteps))
+            : 1.0) {
+    if (strategy == Strategy::IGSPlus && maxSplats <= 0)
+        throw std::invalid_argument("IGSPlus strategy requires maxSplats > 0");
 
     int64_t numPoints = inputData.points.count;
     scale = inputData.scale;
@@ -226,9 +981,13 @@ void Model::setupOptimizers(){
         adam_exp_avg_sq_buf[g] = gpu_zeros(shape, DType::Float32);
         adam_lr[g] = lr_init[g];
     }
+    adam_lr[1] = scaleLrCurrent;
     adam_step_count = 0;
     means_lr_init = 0.00016f;
     means_lr_final = 0.0000016f;
+    meansLrUnscaled = means_lr_init;
+    meansLrGamma = std::pow((double)means_lr_final / (double)means_lr_init, 1.0 / std::max(1, maxSteps));
+    adam_lr[0] = meansLrUnscaled;
 
     densify_split_flag = gpu_zeros({buf_capacity}, DType::Int32);
     densify_dup_flag = gpu_zeros({buf_capacity}, DType::Int32);
@@ -241,6 +1000,11 @@ void Model::setupOptimizers(){
     int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
     densify_compact_scratch = gpu_zeros({(int64_t)buf_capacity * fr_stride}, DType::Float32);
     densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
+    refineWeightMax = gpu_zeros({buf_capacity}, DType::Float32);
+    errorScoreMax = gpu_zeros({buf_capacity}, DType::Float32);
+    igsInitialPoints = num_active;
+    igsCurrentStep = 0;
+    computeBudgetSchedule();
 
     refreshViews();
 }
@@ -256,11 +1020,29 @@ void Model::releaseOptimizers(){
     densify_split_prefix.reset(); densify_dup_prefix.reset();
     densify_keep_flag.reset(); densify_keep_prefix.reset();
     densify_block_totals.reset(); densify_compact_scratch.reset(); densify_random_samples.reset();
+    refineWeightMax.reset();
+    errorScoreMax.reset();
 }
 
 void Model::schedulersStep(int step){
-    float t = std::clamp((float)step / (float)maxSteps, 0.f, 1.f);
-    adam_lr[0] = std::exp(std::log(means_lr_init) * (1.f - t) + std::log(means_lr_final) * t);
+    switch (strategy) {
+        case Strategy::Classic:
+        case Strategy::Hybrid:
+            schedulersStepClassicOrHybrid(*this, step);
+            break;
+        case Strategy::MRNF:
+            meansLrUnscaled *= meansLrGamma;
+            scaleLrCurrent = (float)(scaleLrCurrent * scaleLrGamma);
+            adam_lr[1] = scaleLrCurrent;
+            adam_lr[0] = meansLrUnscaled * (boundsValid ? bounds.medianSize : 1.0f);
+            break;
+        case Strategy::IGSPlus: {
+            double gamma = std::pow(0.1, 1.0 / std::max(1, maxSteps));
+            adam_lr[0] = (float)(adam_lr[0] * gamma);
+            adam_lr[1] = (float)(adam_lr[1] * gamma);
+            break;
+        }
+    }
 }
 
 void Model::refreshViews(){
@@ -305,6 +1087,18 @@ void Model::ensureCapacity(int needed){
     int64_t fr_stride = featuresRest_buf.stride0();
     densify_compact_scratch = gpu_zeros({(int64_t)new_cap * fr_stride}, DType::Float32);
     densify_random_samples = gpu_zeros({new_cap, 3}, DType::Float32);
+    {
+        MTensor new_refine = gpu_zeros({new_cap}, DType::Float32);
+        if (refineWeightMax.defined())
+            memcpy(new_refine.data_ptr(), refineWeightMax.data_ptr(), num_active * sizeof(float));
+        refineWeightMax = std::move(new_refine);
+    }
+    {
+        MTensor new_error = gpu_zeros({new_cap}, DType::Float32);
+        if (errorScoreMax.defined())
+            memcpy(new_error.data_ptr(), errorScoreMax.data_ptr(), num_active * sizeof(float));
+        errorScoreMax = std::move(new_error);
+    }
 
 
     buf_capacity = new_cap;
@@ -317,342 +1111,17 @@ int Model::getDownscaleFactor(int step) {
 }
 
 void Model::afterTrain(int step){
-    if (!radii.defined()) return;
-
-    if (step % refineEvery == 0 && step > warmupLength){
-        int resetInterval = resetAlphaEvery * refineEvery;
-        bool doDensification = step < stopSplitAt && step % resetInterval > numCameras + refineEvery;
-
-        if (doDensification){
-            int numPointsBefore = num_active;
-            ensureCapacity(3 * num_active);  // worst case: every gaussian splits
-
-            // Fill random samples for splits (CPU randn, shared memory)
-            {
-                std::mt19937 rng(step);
-                std::normal_distribution<float> dist(0.0f, 1.0f);
-                float *p = densify_random_samples.data<float>();
-                for (int64_t i = 0; i < 2 * num_active * 3; i++) p[i] = dist(rng);
-            }
-
-            float half_max_dim = 0.5f * static_cast<float>((std::max)(lastWidth, lastHeight));
-            int check_screen = (step < stopScreenSizeAt) ? 1 : 0;
-            bool checkHuge = step > refineEvery * resetAlphaEvery;
-            int fr_stride = (int)featuresRest_buf.stride0();
-
-            // In hybrid mode, save pre-compact stats BEFORE densify:
-            // 1. Count above-threshold splats (for adaptive growth budget)
-            // 2. Save visCounts + gradient norms (for two-CDF donor sampling)
-            int aboveThreshCount = 0;
-            std::vector<float> savedVisCounts;
-            std::vector<float> savedGradWeights;  // per-splat avg gradient norm
-            if (hybridRefine && xysGradNorm.defined() && visCounts.defined()) {
-                msplat_gpu_sync();
-                const float *gn = xysGradNorm.data<float>();
-                const float *vc = visCounts.data<float>();
-                savedVisCounts.assign(vc, vc + num_active);
-                savedGradWeights.resize(num_active);
-                for (int i = 0; i < num_active; i++) {
-                    float avg_grad = (vc[i] > 0) ? (gn[i] / vc[i]) * half_max_dim : 0.0f;
-                    savedGradWeights[i] = avg_grad;
-                    if (avg_grad > densifyGradThresh)
-                        aboveThreshCount++;
-                }
-            }
-
-            // Brush prune threshold: opacity < 1/255 (vs classic 3DGS's 0.1)
-            float cullAlpha = hybridRefine ? (1.0f / 255.0f) : 0.1f;
-
-            int new_count = msplat_densify(
-                num_active, buf_capacity,
-                densifyGradThresh, densifySizeThresh, splitScreenSize, check_screen,
-                cullAlpha, 0.5f, 0.15f, checkHuge ? 1 : 0,
-                xysGradNorm, visCounts, max2DSize, half_max_dim,
-                means_buf, scales_buf, quats_buf,
-                featuresDc_buf, featuresRest_buf, opacities_buf, fr_stride,
-                adam_exp_avg_buf, adam_exp_avg_sq_buf,
-                densify_split_flag, densify_dup_flag,
-                densify_split_prefix, densify_dup_prefix,
-                densify_keep_flag, densify_keep_prefix,
-                densify_block_totals, densify_compact_scratch,
-                densify_random_samples,
-                hybridRefine ? 1 : 0
-            );
-
-            num_active = new_count;
-            refreshViews();
-
-            // ── Hybrid refine: recycle pruned budget + adaptive growth ──
-            // Matches Brush's two-channel approach:
-            //   1. Recycling: replace pruned slots with opacity-weighted donors
-            //   2. Growth: add 20% of above-gradient-threshold splats (adaptive)
-            // CDF build + WOR sampling on CPU; clone + parent update on GPU.
-            if (hybridRefine && num_active > 0) {
-                int freed = std::max(0, numPointsBefore - num_active);
-                // Growth: gradient-adaptive count, with a floor of 5% of population
-                // to match Brush's growth rate (~10K/step from 200K base).
-                static constexpr float GROWTH_SELECT_FRACTION = 0.2f;
-                int grad_growth = (int)(aboveThreshCount * GROWTH_SELECT_FRACTION + 0.5f);
-                int min_growth = 0;
-                if (hybridGrowthFloorDivisor > 0.0f)
-                    min_growth = (int)(num_active / hybridGrowthFloorDivisor);
-                int growth = std::max(grad_growth, min_growth);
-                int budget = freed + growth;
-                if (maxSplats > 0)
-                    budget = std::min(budget, std::max(0, maxSplats - num_active));
-                budget = std::min(budget, num_active);
-
-                if (budget > 0) {
-                    // Reconstruct compacted visibility + gradient weights BEFORE
-                    // ensureCapacity (which can reallocate keep_flag/keep_prefix).
-                    int worst_case = 3 * numPointsBefore;
-                    const int32_t *kf = densify_keep_flag.data<int32_t>();
-                    const int32_t *kp = densify_keep_prefix.data<int32_t>();
-                    std::vector<float> compactVis(num_active, 0.0f);
-                    std::vector<float> compactGrad(num_active, 0.0f);
-                    if (!savedVisCounts.empty()) {
-                        int N_old = numPointsBefore;
-                        for (int i = 0; i < worst_case && i < buf_capacity; i++) {
-                            if (kf[i] == 0) continue;
-                            int dst_idx = kp[i] - 1;
-                            if (dst_idx < 0 || dst_idx >= num_active) continue;
-                            if (i < N_old) {
-                                compactVis[dst_idx] = savedVisCounts[i];
-                                compactGrad[dst_idx] = savedGradWeights[i];
-                            }
-                        }
-                        // Propagate parent stats to split children so they
-                        // participate in the hybrid donor CDF.
-                        const int32_t *sf = densify_split_flag.data<int32_t>();
-                        const int32_t *sp = densify_split_prefix.data<int32_t>();
-                        for (int i = 0; i < N_old; i++) {
-                            if (sf[i] == 0) continue;
-                            int ord = sp[i] - 1;
-                            for (int k = 0; k < 2; k++) {
-                                int child = N_old + 2 * ord + k;
-                                if (child >= worst_case || child >= buf_capacity) continue;
-                                if (kf[child] == 0) continue;
-                                int dst_idx = kp[child] - 1;
-                                if (dst_idx >= 0 && dst_idx < num_active) {
-                                    compactVis[dst_idx] = savedVisCounts[i];
-                                    compactGrad[dst_idx] = savedGradWeights[i];
-                                }
-                            }
-                        }
-                    }
-
-                    ensureCapacity(num_active + budget);
-                    fr_stride = (int)featuresRest_buf.stride0();
-                    float *op = opacities_buf.data<float>();
-
-                    // Weighted sampling without replacement (hybrid densify).
-                    // Weights: sigmoid(opacity) * vis_mask (Brush-style).
-                    // Uses Fenwick tree for O(budget * log N) instead of O(budget * N).
-                    std::vector<double> weights(num_active);
-                    for (int i = 0; i < num_active; i++) {
-                        double sig = 1.0 / (1.0 + std::exp(-(double)op[i]));
-                        double vis = (compactVis[i] > 0) ? 1.0 : 0.0;
-                        weights[i] = sig * vis;
-                    }
-                    FenwickSampler sampler;
-                    sampler.build(weights.data(), num_active);
-
-                    std::vector<int32_t> donorIndices(budget);
-                    std::vector<float> rndSamples(budget * 3);
-                    int recycled = 0;
-
-                    double running = sampler.total();
-                    if (running > 0) {
-                        std::mt19937 rng(step ^ 0xDEADBEEFu);
-                        std::uniform_real_distribution<double> uni(0.0, 1.0);
-                        std::normal_distribution<float> randn(0.0f, 1.0f);
-
-                        for (int d = 0; d < budget; d++) {
-                            running = sampler.total();
-                            if (running <= 0) break;
-                            int c = sampler.draw(uni(rng) * running);
-                            donorIndices[recycled] = c;
-                            rndSamples[recycled*3]   = randn(rng);
-                            rndSamples[recycled*3+1] = randn(rng);
-                            rndSamples[recycled*3+2] = randn(rng);
-                            recycled++;
-                        }
-                    }
-
-                    if (recycled > 0) {
-                        MTensor donorBuf = gpu_empty({(int64_t)recycled}, DType::Int32);
-                        memcpy(donorBuf.data_ptr(), donorIndices.data(), recycled * sizeof(int32_t));
-                        memcpy(densify_random_samples.data_ptr(), rndSamples.data(), recycled * 3 * sizeof(float));
-
-                        msplat_hybrid_refine(
-                            num_active, recycled, fr_stride,
-                            donorBuf, densify_random_samples,
-                            means_buf, scales_buf, quats_buf,
-                            featuresDc_buf, featuresRest_buf, opacities_buf,
-                            adam_exp_avg_buf, adam_exp_avg_sq_buf
-                        );
-                    }
-
-                    num_active += recycled;
-                    refreshViews();
-                }
-            }
-
-            std::cout << "Densified: " << numPointsBefore << " -> " << num_active << " gaussians"
-                      << (hybridRefine ? " (hybrid)" : "") << std::endl;
-        }
-
-        // Opacity reset: classic 3DGS mechanism that clamps all opacities to
-        // logit(0.2). Disabled in hybrid mode — Brush uses continuous decay
-        // instead, and the reset conflicts with it by reviving background splats
-        // that decay has been pushing toward zero.
-        if (!hybridRefine && !maskAwareData && step < stopSplitAt && step % resetInterval == refineEvery){
-            msplat_gpu_sync();
-            constexpr float resetLogit = -1.3862943611198906f;
-            float *op = opacities.data<float>();
-            for (int64_t i = 0; i < opacities.numel(); i++)
-                if (op[i] > resetLogit) op[i] = resetLogit;
-
-            adam_exp_avg[5].zero();
-            adam_exp_avg_sq[5].zero();
-            fprintf(stderr, "Opacity reset at step %d\n", step);
-        }
-
-        xysGradNorm.reset();
-        visCounts.reset();
-        max2DSize.reset();
-    }
-
-    // ── Brush-style opacity/scale decay + continuous prune + recycle ──
-    // Runs every refineEvery steps (matching LichtFeld/Brush cadence).
-    // The decay constants (0.004 opacity, 0.002 scale) are calibrated
-    // for per-refine-step application, not per-training-step.
-    // "ALWAYS" means this runs even after stopSplitAt — keeping the
-    // population stable via decay→prune→recycle after growth ends.
-    if (hybridRefine && step > warmupLength && step % refineEvery == 0) {
-        msplat_gpu_sync();
-        static constexpr float OPAC_DECAY = 0.004f;
-        static constexpr float SCALE_DECAY = 0.002f;
-        static constexpr float MIN_OPACITY = 1.0f / 255.0f;
-        float train_t = std::clamp((float)step / (float)maxSteps, 0.0f, 1.0f);
-        float shrink_strength = 1.0f - train_t;
-        float minus_opac = OPAC_DECAY * shrink_strength;
-        float scale_factor = 1.0f - SCALE_DECAY * shrink_strength;
-
-        float *op = opacities.data<float>();
-        float *sc = scales.data<float>();
-        int n = num_active;
-
-        // Apply decay
-        if (minus_opac > 0 || scale_factor < 1.0f) {
-            float log_sf = std::log(scale_factor);
-            for (int i = 0; i < n; i++) {
-                float sig = 1.0f / (1.0f + std::exp(-op[i]));
-                float new_sig = std::clamp(sig - minus_opac, 1e-6f, 1.0f - 1e-6f);
-                op[i] = std::log(new_sig / (1.0f - new_sig));
-                sc[i*3] += log_sf; sc[i*3+1] += log_sf; sc[i*3+2] += log_sf;
-            }
-        }
-
-        // Continuous pruning: compact in-place
-        int pre_prune = num_active;
-        int dst = 0;
-        float *mn = means.data<float>();
-        float *qt = quats.data<float>();
-        float *dc = featuresDc.data<float>();
-        float *fr = featuresRest.data<float>();
-        int fr_stride = (int)featuresRest_buf.stride0();
-        int strides[6] = {3, 3, 4, 3, fr_stride, 1};
-        float *param_ptrs[6] = {mn, sc, qt, dc, fr, op};
-        float *adam_ea_ptrs[6], *adam_es_ptrs[6];
-        for (int g = 0; g < N_ADAM_GROUPS; g++) {
-            adam_ea_ptrs[g] = adam_exp_avg[g].data<float>();
-            adam_es_ptrs[g] = adam_exp_avg_sq[g].data<float>();
-        }
-
-        for (int i = 0; i < n; i++) {
-            float sig = 1.0f / (1.0f + std::exp(-op[i]));
-            float s0 = std::exp(sc[i*3]), s1 = std::exp(sc[i*3+1]), s2 = std::exp(sc[i*3+2]);
-            float max_s = std::max({s0, s1, s2});
-            float min_s = std::min({s0, s1, s2});
-
-            bool dead = sig < MIN_OPACITY || min_s < 1e-10f || max_s > scale * 100.0f;
-            if (dead) continue;
-
-            if (dst != i) {
-                for (int g = 0; g < N_ADAM_GROUPS; g++) {
-                    memmove(&param_ptrs[g][dst * strides[g]], &param_ptrs[g][i * strides[g]], strides[g] * sizeof(float));
-                    memmove(&adam_ea_ptrs[g][dst * strides[g]], &adam_ea_ptrs[g][i * strides[g]], strides[g] * sizeof(float));
-                    memmove(&adam_es_ptrs[g][dst * strides[g]], &adam_es_ptrs[g][i * strides[g]], strides[g] * sizeof(float));
-                }
-            }
-            dst++;
-        }
-
-        if (dst < num_active) {
-            num_active = dst;
-            refreshViews();
-        }
-
-        // Recycle pruned budget via opacity-weighted donor sampling.
-        // This runs ALWAYS (not just during densification), matching Brush.
-        int pruned = pre_prune - num_active;
-        if (pruned > 0 && num_active > 0) {
-            int budget = std::min(pruned, num_active);
-            if (maxSplats > 0)
-                budget = std::min(budget, std::max(0, maxSplats - num_active));
-
-            if (budget > 0) {
-                ensureCapacity(num_active + budget);
-                fr_stride = (int)featuresRest_buf.stride0();
-                op = opacities_buf.data<float>();
-
-                // Weighted sampling without replacement (continuous-prune recycle).
-                // Uses Fenwick tree for O(budget * log N) instead of O(budget * N).
-                std::vector<double> weights(num_active);
-                for (int i = 0; i < num_active; i++) {
-                    double sig = 1.0 / (1.0 + std::exp(-(double)op[i]));
-                    weights[i] = sig;
-                }
-                FenwickSampler sampler;
-                sampler.build(weights.data(), num_active);
-                double running = sampler.total();
-                if (running > 0) {
-                    std::mt19937 rng(step ^ 0xABCD1234u);
-                    std::uniform_real_distribution<double> uni(0.0, 1.0);
-                    std::normal_distribution<float> randn(0.0f, 1.0f);
-                    std::vector<int32_t> donorIdx(budget);
-                    std::vector<float> rndBuf(budget * 3);
-                    int recycled = 0;
-
-                    for (int d = 0; d < budget; d++) {
-                        running = sampler.total();
-                        if (running <= 0) break;
-                        int c = sampler.draw(uni(rng) * running);
-                        donorIdx[recycled] = c;
-                        rndBuf[recycled*3]   = randn(rng);
-                        rndBuf[recycled*3+1] = randn(rng);
-                        rndBuf[recycled*3+2] = randn(rng);
-                        recycled++;
-                    }
-
-                    if (recycled > 0) {
-                        MTensor donorBuf = gpu_empty({(int64_t)recycled}, DType::Int32);
-                        memcpy(donorBuf.data_ptr(), donorIdx.data(), recycled * sizeof(int32_t));
-                        memcpy(densify_random_samples.data_ptr(), rndBuf.data(), recycled * 3 * sizeof(float));
-                        msplat_hybrid_refine(
-                            num_active, recycled, fr_stride,
-                            donorBuf, densify_random_samples,
-                            means_buf, scales_buf, quats_buf,
-                            featuresDc_buf, featuresRest_buf, opacities_buf,
-                            adam_exp_avg_buf, adam_exp_avg_sq_buf
-                        );
-                        num_active += recycled;
-                        refreshViews();
-                    }
-                }
-            }
-        }
+    switch (strategy) {
+        case Strategy::Classic:
+        case Strategy::Hybrid:
+            afterTrainClassicOrHybrid(*this, step);
+            break;
+        case Strategy::MRNF:
+            afterTrainMRNF(*this, step);
+            break;
+        case Strategy::IGSPlus:
+            afterTrainIGSPlus(*this, step);
+            break;
     }
 }
 
@@ -736,7 +1205,7 @@ void Model::applyMaskOpacityPenalty(std::vector<Camera>& cameras, int step) {
 }
 
 void Model::applyMeanNoise(int step) {
-    if (!hybridRefine) return;
+    if (strategy != Strategy::Hybrid) return;
     if (!radii.defined() || meanNoiseWeight <= 0.0f) return;
     if (noiseStopAt > 0 && step >= noiseStopAt) return;
 
@@ -754,8 +1223,73 @@ void Model::applyMeanNoise(int step) {
         quats,
         opacities,
         radii,
+        nullptr,
+        0.0f,
         (uint32_t)(step ^ 0x9E3779B9u)
     );
+}
+
+void Model::computeBounds() {
+    if (num_active <= 0) {
+        bounds = SceneBounds{};
+        boundsValid = false;
+        return;
+    }
+
+    msplat_gpu_sync();
+    const float *mn = means.data<float>();
+    float p = std::clamp(boundsPercentile, 0.5f, 0.999f);
+    int low_idx = (int)std::floor((double)(num_active - 1) * (1.0 - p));
+    int high_idx = (int)std::floor((double)(num_active - 1) * p);
+
+    for (int axis = 0; axis < 3; ++axis) {
+        std::vector<float> vals(num_active);
+        for (int i = 0; i < num_active; ++i) vals[i] = mn[i*3 + axis];
+        std::nth_element(vals.begin(), vals.begin() + low_idx, vals.end());
+        float lo = vals[low_idx];
+        std::nth_element(vals.begin(), vals.begin() + high_idx, vals.end());
+        float hi = vals[high_idx];
+        bounds.center[axis] = 0.5f * (lo + hi);
+        bounds.extent[axis] = std::max(0.5f * (hi - lo), 1e-6f);
+    }
+
+    float extents[3] = {bounds.extent[0], bounds.extent[1], bounds.extent[2]};
+    std::sort(extents, extents + 3);
+    bounds.medianSize = extents[1];
+    bounds.maxExtent = std::max({bounds.extent[0], bounds.extent[1], bounds.extent[2], 1e-6f});
+    boundsValid = bounds.medianSize > 0.0f && bounds.maxExtent > 0.0f;
+}
+
+void Model::computeBudgetSchedule() {
+    budgetSchedule.clear();
+    igsTotalSteps = 0;
+    int64_t scheduleInitial = (igsInitialPoints > 0) ? igsInitialPoints : num_active;
+    igsInitialPoints = scheduleInitial;
+
+    if (strategy != Strategy::IGSPlus || maxSplats <= 0 || scheduleInitial <= 0) {
+        budgetSchedule.push_back(num_active);
+        igsCurrentStep = 0;
+        return;
+    }
+
+    for (int step = refineEvery; step < stopSplitAt; step += refineEvery) {
+        if (step > warmupLength) igsTotalSteps++;
+    }
+    igsTotalSteps = std::max(igsTotalSteps, 1);
+
+    budgetSchedule.resize(igsTotalSteps + 1);
+    budgetSchedule[0] = scheduleInitial;
+    int64_t growth_total = std::max<int64_t>(0, (int64_t)maxSplats - scheduleInitial);
+    double linear_slope = (double)growth_total / (double)igsTotalSteps;
+    for (int i = 1; i <= igsTotalSteps; ++i) {
+        double t = (double)i / (double)igsTotalSteps;
+        double quad = (double)scheduleInitial + (double)growth_total * t * t;
+        double linear = (double)scheduleInitial + linear_slope * (double)i;
+        int64_t budget = (int64_t)std::llround(std::max(quad, linear));
+        budgetSchedule[i] = std::min<int64_t>(budget, maxSplats);
+    }
+    budgetSchedule.back() = maxSplats;
+    igsCurrentStep = std::clamp(igsCurrentStep, 0, igsTotalSteps);
 }
 
 void Model::save(const std::string &filename, int step) {
@@ -794,7 +1328,7 @@ int Model::loadPly(const std::string &filename){
 // ── Checkpoint save/load ────────────────────────────────────────────────────
 
 static constexpr uint32_t CKPT_MAGIC = 0x4C50534D; // "MSPL"
-static constexpr uint32_t CKPT_VERSION = 1;
+static constexpr uint32_t CKPT_VERSION = 2;
 
 static void writeTensor(std::ofstream &f, MTensor &t) {
     uint32_t ndim = t.ndim();
@@ -855,6 +1389,25 @@ void Model::saveCheckpoint(const std::string &filename, int step) {
     for (int g = 0; g < N_ADAM_GROUPS; g++) writeTensor(f, adam_exp_avg[g]);
     for (int g = 0; g < N_ADAM_GROUPS; g++) writeTensor(f, adam_exp_avg_sq[g]);
 
+    // Version 2 trailer: strategy + strategy-specific runtime state.
+    uint32_t strategy_u = static_cast<uint32_t>(strategy);
+    uint32_t bounds_valid_u = boundsValid ? 1u : 0u;
+    uint32_t refine_windows_u = static_cast<uint32_t>(std::max(refineWindowsSinceBounds, 0));
+    uint32_t igs_step_u = static_cast<uint32_t>(std::max(igsCurrentStep, 0));
+    f.write(reinterpret_cast<const char*>(&strategy_u), sizeof(strategy_u));
+    f.write(reinterpret_cast<const char*>(&bounds_valid_u), sizeof(bounds_valid_u));
+    f.write(reinterpret_cast<const char*>(bounds.center), sizeof(bounds.center));
+    f.write(reinterpret_cast<const char*>(bounds.extent), sizeof(bounds.extent));
+    f.write(reinterpret_cast<const char*>(&bounds.medianSize), sizeof(bounds.medianSize));
+    f.write(reinterpret_cast<const char*>(&bounds.maxExtent), sizeof(bounds.maxExtent));
+    f.write(reinterpret_cast<const char*>(&refine_windows_u), sizeof(refine_windows_u));
+    f.write(reinterpret_cast<const char*>(&meansLrUnscaled), sizeof(meansLrUnscaled));
+    f.write(reinterpret_cast<const char*>(&scaleLrCurrent), sizeof(scaleLrCurrent));
+    f.write(reinterpret_cast<const char*>(&meansLrGamma), sizeof(meansLrGamma));
+    f.write(reinterpret_cast<const char*>(&scaleLrGamma), sizeof(scaleLrGamma));
+    f.write(reinterpret_cast<const char*>(&igs_step_u), sizeof(igs_step_u));
+    f.write(reinterpret_cast<const char*>(&igsInitialPoints), sizeof(igsInitialPoints));
+
     f.close();
     std::cout << "Checkpoint saved: " << filename << " (step " << step
               << ", " << num_active << " gaussians, "
@@ -870,7 +1423,8 @@ int Model::loadCheckpoint(const std::string &filename) {
     f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
     f.read(reinterpret_cast<char*>(&version), sizeof(version));
     if (magic != CKPT_MAGIC) throw std::runtime_error("Not a valid msplat checkpoint file");
-    if (version != CKPT_VERSION) throw std::runtime_error("Unsupported checkpoint version: " + std::to_string(version));
+    if (version < 1 || version > CKPT_VERSION)
+        throw std::runtime_error("Unsupported checkpoint version: " + std::to_string(version));
 
     // Scalar state
     uint32_t step, numPts, shDeg, adamSteps;
@@ -895,6 +1449,43 @@ int Model::loadCheckpoint(const std::string &filename) {
     // Optimizer state
     for (int g = 0; g < N_ADAM_GROUPS; g++) adam_exp_avg[g] = readTensor(f);
     for (int g = 0; g < N_ADAM_GROUPS; g++) adam_exp_avg_sq[g] = readTensor(f);
+
+    if (version >= 2) {
+        uint32_t strategy_u = 0, bounds_valid_u = 0, refine_windows_u = 0, igs_step_u = 0;
+        f.read(reinterpret_cast<char*>(&strategy_u), sizeof(strategy_u));
+        f.read(reinterpret_cast<char*>(&bounds_valid_u), sizeof(bounds_valid_u));
+        f.read(reinterpret_cast<char*>(bounds.center), sizeof(bounds.center));
+        f.read(reinterpret_cast<char*>(bounds.extent), sizeof(bounds.extent));
+        f.read(reinterpret_cast<char*>(&bounds.medianSize), sizeof(bounds.medianSize));
+        f.read(reinterpret_cast<char*>(&bounds.maxExtent), sizeof(bounds.maxExtent));
+        f.read(reinterpret_cast<char*>(&refine_windows_u), sizeof(refine_windows_u));
+        f.read(reinterpret_cast<char*>(&meansLrUnscaled), sizeof(meansLrUnscaled));
+        f.read(reinterpret_cast<char*>(&scaleLrCurrent), sizeof(scaleLrCurrent));
+        f.read(reinterpret_cast<char*>(&meansLrGamma), sizeof(meansLrGamma));
+        f.read(reinterpret_cast<char*>(&scaleLrGamma), sizeof(scaleLrGamma));
+        f.read(reinterpret_cast<char*>(&igs_step_u), sizeof(igs_step_u));
+        f.read(reinterpret_cast<char*>(&igsInitialPoints), sizeof(igsInitialPoints));
+
+        if (strategy_u > static_cast<uint32_t>(Strategy::IGSPlus))
+            throw std::runtime_error("Unsupported checkpoint strategy: " + std::to_string(strategy_u));
+        strategy = static_cast<Strategy>(strategy_u);
+        boundsValid = bounds_valid_u != 0;
+        refineWindowsSinceBounds = static_cast<int>(refine_windows_u);
+        igsCurrentStep = static_cast<int>(igs_step_u);
+    } else {
+        strategy = hybridRefine ? Strategy::Hybrid : Strategy::Classic;
+        bounds = SceneBounds{};
+        boundsValid = false;
+        refineWindowsSinceBounds = 0;
+        meansLrUnscaled = adam_lr[0];
+        scaleLrCurrent = adam_lr[1];
+        meansLrGamma = std::pow((double)means_lr_final / (double)means_lr_init, 1.0 / std::max(1, maxSteps));
+        igsCurrentStep = 0;
+        igsInitialPoints = numPts;
+    }
+    hybridRefine = strategyUsesHybridRefine(strategy);
+    if (strategy == Strategy::IGSPlus && maxSplats <= 0)
+        throw std::runtime_error("IGSPlus checkpoint requires maxSplats > 0 in the current config");
 
     f.close();
 
@@ -941,6 +1532,11 @@ int Model::loadCheckpoint(const std::string &filename) {
     int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
     densify_compact_scratch = gpu_zeros({(int64_t)buf_capacity * fr_stride}, DType::Float32);
     densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
+    refineWeightMax = gpu_zeros({buf_capacity}, DType::Float32);
+    errorScoreMax = gpu_zeros({buf_capacity}, DType::Float32);
+    if (strategy != Strategy::IGSPlus || igsInitialPoints <= 0) igsInitialPoints = num_active;
+    if (strategy != Strategy::IGSPlus) igsCurrentStep = 0;
+    computeBudgetSchedule();
 
     refreshViews();
 

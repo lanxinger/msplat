@@ -15,10 +15,21 @@
 #include <mutex>
 #include <numeric>
 #include <random>
+#include <stdexcept>
 
 #include <dispatch/dispatch.h>
 
 namespace msplat {
+
+static Strategy strategyFromInt(int value) {
+    switch (value) {
+        case 0: return Strategy::Classic;
+        case 1: return Strategy::Hybrid;
+        case 2: return Strategy::MRNF;
+        case 3: return Strategy::IGSPlus;
+        default: throw std::invalid_argument("Invalid training strategy: " + std::to_string(value));
+    }
+}
 
 // ── Dataset::Impl ───────────────────────────────────────────────────────────
 
@@ -137,7 +148,10 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
         config.densifyGradThresh, config.densifySizeThresh,
         config.stopScreenSizeAt, config.splitScreenSize,
         config.iterations, config.keepCrs, config.meanNoiseWeight, config.noiseStopAt,
-        config.hybridRefine, config.maxSplats, config.hybridGrowthFloorDivisor,
+        strategyFromInt(config.strategy), config.maxSplats, config.hybridGrowthFloorDivisor,
+        config.growthGradThreshold, config.growFraction, config.growUntilIter,
+        config.opacityDecay, config.scaleDecay, config.boundsPercentile,
+        config.scalesLrInit, config.scalesLrFinal,
         config.bgColor
     );
 
@@ -423,9 +437,17 @@ static msplat::Config configFromC(MsplatConfig c) {
     cfg.splitScreenSize = c.splitScreenSize;
     cfg.meanNoiseWeight = c.meanNoiseWeight;
     cfg.noiseStopAt = c.noiseStopAt;
-    cfg.hybridRefine = c.hybridRefine;
+    cfg.strategy = c.strategy;
     cfg.maxSplats = c.maxSplats;
     cfg.hybridGrowthFloorDivisor = c.hybridGrowthFloorDivisor;
+    cfg.growthGradThreshold = c.growthGradThreshold;
+    cfg.growFraction = c.growFraction;
+    cfg.growUntilIter = c.growUntilIter;
+    cfg.opacityDecay = c.opacityDecay;
+    cfg.scaleDecay = c.scaleDecay;
+    cfg.boundsPercentile = c.boundsPercentile;
+    cfg.scalesLrInit = c.scalesLrInit;
+    cfg.scalesLrFinal = c.scalesLrFinal;
     cfg.keepCrs = c.keepCrs;
     cfg.downscaleFactor = c.downscaleFactor;
     memcpy(cfg.bgColor, c.bgColor, sizeof(cfg.bgColor));

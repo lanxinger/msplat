@@ -121,6 +121,13 @@ target_link_libraries(msplat PRIVATE
 target_compile_definitions(msplat PRIVATE USE_MPS)
 install(TARGETS msplat DESTINATION bin)
 
+add_executable(msplat_long_axis_split_test tests/long_axis_split_test.cpp)
+target_link_libraries(msplat_long_axis_split_test PRIVATE
+    msplat_core
+    pthread
+)
+target_compile_definitions(msplat_long_axis_split_test PRIVATE USE_MPS)
+
 # --- Python bindings (optional, enabled when building via scikit-build-core) ---
 
 option(MSPLAT_BUILD_PYTHON "Build nanobind Python bindings" OFF)

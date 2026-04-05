@@ -97,6 +97,14 @@ void msplat_hybrid_refine(
     MTensor adam_exp_avg_buf[], MTensor adam_exp_avg_sq_buf[]
 );
 
+void msplat_long_axis_split(
+    int num_splits, int dst_offset, int fr_stride,
+    MTensor &donor_indices,
+    MTensor &means_buf, MTensor &scales_buf, MTensor &quats_buf,
+    MTensor &featuresDc_buf, MTensor &featuresRest_buf, MTensor &opacities_buf,
+    MTensor adam_exp_avg_buf[], MTensor adam_exp_avg_sq_buf[]
+);
+
 void msplat_apply_mean_noise(
     int N,
     float mean_noise_weight,
@@ -106,6 +114,8 @@ void msplat_apply_mean_noise(
     MTensor &quats,
     MTensor &opacities,
     MTensor &radii,
+    MTensor *vis_counts,
+    float median_scale,
     uint32_t step_seed
 );
 

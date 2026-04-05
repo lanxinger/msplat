@@ -162,6 +162,7 @@ struct MetalContext {
     id<MTLComputePipelineState> compact_scatter_kernel_cpso;
     id<MTLComputePipelineState> compact_copy_back_kernel_cpso;
     id<MTLComputePipelineState> hybrid_refine_kernel_cpso;
+    id<MTLComputePipelineState> long_axis_split_kernel_cpso;
 };
 
 // Explicit metallib path (set by Swift/Python wrappers before first use)
@@ -267,6 +268,7 @@ MetalContext* init_msplat_metal_context() {
     ctx->compact_scatter_kernel_cpso              = load(@"compact_scatter_kernel");
     ctx->compact_copy_back_kernel_cpso            = load(@"compact_copy_back_kernel");
     ctx->hybrid_refine_kernel_cpso                = load(@"hybrid_refine_kernel");
+    ctx->long_axis_split_kernel_cpso              = load(@"long_axis_split_kernel");
 
     [metal_library release];
 
@@ -1633,6 +1635,8 @@ void msplat_apply_mean_noise(
     MTensor &quats,
     MTensor &opacities,
     MTensor &radii,
+    MTensor *vis_counts,
+    float median_scale,
     uint32_t step_seed
 ) {
     if (N <= 0 || mean_noise_weight <= 0.0f || lr_mean <= 0.0f) return;
@@ -1657,7 +1661,13 @@ void msplat_apply_mean_noise(
         ENC_BUF(enc, quats, 5);
         ENC_BUF(enc, opacities, 6);
         ENC_BUF(enc, radii, 7);
-        ENC_SCALAR(enc, step_seed, 8);
+        if (vis_counts) {
+            [enc setBuffer:vis_counts->buffer() offset:0 atIndex:8];
+        } else {
+            [enc setBuffer:nil offset:0 atIndex:8];
+        }
+        ENC_SCALAR(enc, median_scale, 9);
+        ENC_SCALAR(enc, step_seed, 10);
         [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
 
         [enc endEncoding];
@@ -1711,6 +1721,57 @@ void msplat_hybrid_refine(
         ENC_BUF(enc, adam_exp_avg_sq_buf[4], 21);
         ENC_BUF(enc, adam_exp_avg_sq_buf[5], 22);
         [enc dispatchThreads:MTLSizeMake(budget, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+
+        [enc endEncoding];
+    });
+}
+
+void msplat_long_axis_split(
+    int num_splits, int dst_offset, int fr_stride,
+    MTensor &donor_indices,
+    MTensor &means_buf, MTensor &scales_buf, MTensor &quats_buf,
+    MTensor &featuresDc_buf, MTensor &featuresRest_buf, MTensor &opacities_buf,
+    MTensor adam_exp_avg_buf[], MTensor adam_exp_avg_sq_buf[]
+) {
+    if (num_splits <= 0) return;
+
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    assert(command_buffer && "Failed to retrieve command buffer reference");
+
+    uint32_t splits_u32 = (uint32_t)num_splits;
+    uint32_t dst_u32 = (uint32_t)dst_offset;
+    int fr_stride_val = fr_stride;
+
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        assert(enc && "Failed to create compute command encoder");
+
+        NSUInteger tpg = MIN(ctx->long_axis_split_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_splits);
+        [enc setComputePipelineState:ctx->long_axis_split_kernel_cpso];
+        ENC_SCALAR(enc, splits_u32, 0);
+        ENC_BUF(enc, donor_indices, 1);
+        ENC_BUF(enc, means_buf, 2);
+        ENC_BUF(enc, scales_buf, 3);
+        ENC_BUF(enc, quats_buf, 4);
+        ENC_BUF(enc, featuresDc_buf, 5);
+        ENC_BUF(enc, featuresRest_buf, 6);
+        ENC_BUF(enc, opacities_buf, 7);
+        ENC_SCALAR(enc, fr_stride_val, 8);
+        ENC_SCALAR(enc, dst_u32, 9);
+        ENC_BUF(enc, adam_exp_avg_buf[0], 10);
+        ENC_BUF(enc, adam_exp_avg_buf[1], 11);
+        ENC_BUF(enc, adam_exp_avg_buf[2], 12);
+        ENC_BUF(enc, adam_exp_avg_buf[3], 13);
+        ENC_BUF(enc, adam_exp_avg_buf[4], 14);
+        ENC_BUF(enc, adam_exp_avg_buf[5], 15);
+        ENC_BUF(enc, adam_exp_avg_sq_buf[0], 16);
+        ENC_BUF(enc, adam_exp_avg_sq_buf[1], 17);
+        ENC_BUF(enc, adam_exp_avg_sq_buf[2], 18);
+        ENC_BUF(enc, adam_exp_avg_sq_buf[3], 19);
+        ENC_BUF(enc, adam_exp_avg_sq_buf[4], 20);
+        ENC_BUF(enc, adam_exp_avg_sq_buf[5], 21);
+        [enc dispatchThreads:MTLSizeMake(num_splits, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
 
         [enc endEncoding];
     });

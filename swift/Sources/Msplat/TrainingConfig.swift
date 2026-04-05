@@ -17,8 +17,16 @@ public struct TrainingConfig {
     public var splitScreenSize: Float = 0.05
     public var meanNoiseWeight: Float = 50.0
     public var noiseStopAt: Int32 = 15_000
-    public var hybridRefine: Bool = false
+    public var strategy: Int32 = 0
     public var maxSplats: Int32 = 0
+    public var growthGradThreshold: Float = 0.003
+    public var growFraction: Float = 0.07
+    public var growUntilIter: Int32 = 15_000
+    public var opacityDecay: Float = 0.004
+    public var scaleDecay: Float = 0.002
+    public var boundsPercentile: Float = 0.8
+    public var scalesLrInit: Float = 0.005
+    public var scalesLrFinal: Float = 0.00005
     public var keepCrs: Bool = false
     public var downscaleFactor: Float = 1.0
     /// Background color as (R, G, B) in [0, 1]. Default magenta — high contrast
@@ -44,8 +52,16 @@ public struct TrainingConfig {
         c.splitScreenSize = splitScreenSize
         c.meanNoiseWeight = meanNoiseWeight
         c.noiseStopAt = noiseStopAt
-        c.hybridRefine = hybridRefine
+        c.strategy = strategy
         c.maxSplats = maxSplats
+        c.growthGradThreshold = growthGradThreshold
+        c.growFraction = growFraction
+        c.growUntilIter = growUntilIter
+        c.opacityDecay = opacityDecay
+        c.scaleDecay = scaleDecay
+        c.boundsPercentile = boundsPercentile
+        c.scalesLrInit = scalesLrInit
+        c.scalesLrFinal = scalesLrFinal
         c.keepCrs = keepCrs
         c.downscaleFactor = downscaleFactor
         c.bgColor = (bgColor.0, bgColor.1, bgColor.2)

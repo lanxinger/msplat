@@ -15,10 +15,23 @@
 #include <algorithm>
 #include <numeric>
 #include <random>
+#include <stdexcept>
 
 namespace nb = nanobind;
 using namespace nb::literals;
 namespace fs = std::filesystem;
+
+namespace {
+
+Strategy parse_strategy_name(const std::string &name) {
+    if (name == "classic") return Strategy::Classic;
+    if (name == "hybrid") return Strategy::Hybrid;
+    if (name == "mrnf") return Strategy::MRNF;
+    if (name == "igsplus") return Strategy::IGSPlus;
+    throw std::invalid_argument("strategy must be one of: classic, hybrid, mrnf, igsplus");
+}
+
+}  // namespace
 
 // ── TrainingConfig ──────────────────────────────────────────────────────────
 
@@ -38,9 +51,17 @@ struct TrainingConfig {
     float split_screen_size = 0.05f;
     float mean_noise_weight = 50.0f;
     int noise_stop_at = 15000;
-    bool hybrid_refine = false;
+    std::string strategy = "classic";
     int max_splats = 0;
     float hybrid_growth_floor_divisor = 33.0f;
+    float growth_grad_threshold = 0.003f;
+    float grow_fraction = 0.07f;
+    int grow_until_iter = 15000;
+    float opacity_decay = 0.004f;
+    float scale_decay = 0.002f;
+    float bounds_percentile = 0.8f;
+    float scales_lr_init = 0.005f;
+    float scales_lr_final = 0.00005f;
     bool keep_crs = false;
     float downscale_factor = 1.0f;
     std::string output = "splat.ply";
@@ -127,7 +148,10 @@ public:
             cfg.densify_grad_thresh, cfg.densify_size_thresh,
             cfg.stop_screen_size_at, cfg.split_screen_size,
             cfg.iterations, cfg.keep_crs, cfg.mean_noise_weight, cfg.noise_stop_at,
-            cfg.hybrid_refine, cfg.max_splats, cfg.hybrid_growth_floor_divisor,
+            parse_strategy_name(cfg.strategy), cfg.max_splats, cfg.hybrid_growth_floor_divisor,
+            cfg.growth_grad_threshold, cfg.grow_fraction, cfg.grow_until_iter,
+            cfg.opacity_decay, cfg.scale_decay, cfg.bounds_percentile,
+            cfg.scales_lr_init, cfg.scales_lr_final,
             cfg.bg_color.data()
         );
 
@@ -311,7 +335,10 @@ NB_MODULE(_core, m) {
                 const std::string &output, int save_every,
                 std::vector<float> bg_color,
                 float mean_noise_weight, int noise_stop_at,
-                bool hybrid_refine, int max_splats, float hybrid_growth_floor_divisor) {
+                const std::string &strategy, int max_splats, float hybrid_growth_floor_divisor,
+                float growth_grad_threshold, float grow_fraction, int grow_until_iter,
+                float opacity_decay, float scale_decay, float bounds_percentile,
+                float scales_lr_init, float scales_lr_final) {
             new (cfg) TrainingConfig();
             cfg->iterations = iterations;
             cfg->sh_degree = sh_degree;
@@ -335,9 +362,18 @@ NB_MODULE(_core, m) {
             cfg->bg_color = bg_color;
             cfg->mean_noise_weight = mean_noise_weight;
             cfg->noise_stop_at = noise_stop_at;
-            cfg->hybrid_refine = hybrid_refine;
+            parse_strategy_name(strategy);
+            cfg->strategy = strategy;
             cfg->max_splats = max_splats;
             cfg->hybrid_growth_floor_divisor = hybrid_growth_floor_divisor;
+            cfg->growth_grad_threshold = growth_grad_threshold;
+            cfg->grow_fraction = grow_fraction;
+            cfg->grow_until_iter = grow_until_iter;
+            cfg->opacity_decay = opacity_decay;
+            cfg->scale_decay = scale_decay;
+            cfg->bounds_percentile = bounds_percentile;
+            cfg->scales_lr_init = scales_lr_init;
+            cfg->scales_lr_final = scales_lr_final;
         },
             "iterations"_a = 30000,
             "sh_degree"_a = 3,
@@ -359,9 +395,17 @@ NB_MODULE(_core, m) {
             "bg_color"_a = std::vector<float>{0.0f, 0.0f, 0.0f},
             "mean_noise_weight"_a = 50.0f,
             "noise_stop_at"_a = 15000,
-            "hybrid_refine"_a = false,
+            "strategy"_a = "classic",
             "max_splats"_a = 0,
-            "hybrid_growth_floor_divisor"_a = 33.0f)
+            "hybrid_growth_floor_divisor"_a = 33.0f,
+            "growth_grad_threshold"_a = 0.003f,
+            "grow_fraction"_a = 0.07f,
+            "grow_until_iter"_a = 15000,
+            "opacity_decay"_a = 0.004f,
+            "scale_decay"_a = 0.002f,
+            "bounds_percentile"_a = 0.8f,
+            "scales_lr_init"_a = 0.005f,
+            "scales_lr_final"_a = 0.00005f)
         .def_rw("iterations", &TrainingConfig::iterations)
         .def_rw("sh_degree", &TrainingConfig::sh_degree)
         .def_rw("sh_degree_interval", &TrainingConfig::sh_degree_interval)
@@ -377,9 +421,17 @@ NB_MODULE(_core, m) {
         .def_rw("split_screen_size", &TrainingConfig::split_screen_size)
         .def_rw("mean_noise_weight", &TrainingConfig::mean_noise_weight)
         .def_rw("noise_stop_at", &TrainingConfig::noise_stop_at)
-        .def_rw("hybrid_refine", &TrainingConfig::hybrid_refine)
+        .def_rw("strategy", &TrainingConfig::strategy)
         .def_rw("max_splats", &TrainingConfig::max_splats)
         .def_rw("hybrid_growth_floor_divisor", &TrainingConfig::hybrid_growth_floor_divisor)
+        .def_rw("growth_grad_threshold", &TrainingConfig::growth_grad_threshold)
+        .def_rw("grow_fraction", &TrainingConfig::grow_fraction)
+        .def_rw("grow_until_iter", &TrainingConfig::grow_until_iter)
+        .def_rw("opacity_decay", &TrainingConfig::opacity_decay)
+        .def_rw("scale_decay", &TrainingConfig::scale_decay)
+        .def_rw("bounds_percentile", &TrainingConfig::bounds_percentile)
+        .def_rw("scales_lr_init", &TrainingConfig::scales_lr_init)
+        .def_rw("scales_lr_final", &TrainingConfig::scales_lr_final)
         .def_rw("keep_crs", &TrainingConfig::keep_crs)
         .def_rw("downscale_factor", &TrainingConfig::downscale_factor)
         .def_rw("output", &TrainingConfig::output)

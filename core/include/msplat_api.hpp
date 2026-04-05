@@ -29,9 +29,17 @@ struct Config {
     float splitScreenSize = 0.05f;
     float meanNoiseWeight = 50.0f;
     int noiseStopAt = 15000;
-    bool hybridRefine = false;
+    int strategy = 0;  // 0=Classic, 1=Hybrid, 2=MRNF, 3=IGSPlus
     int maxSplats = 0;
     float hybridGrowthFloorDivisor = 33.0f;
+    float growthGradThreshold = 0.003f;
+    float growFraction = 0.07f;
+    int growUntilIter = 15000;
+    float opacityDecay = 0.004f;
+    float scaleDecay = 0.002f;
+    float boundsPercentile = 0.8f;
+    float scalesLrInit = 0.005f;
+    float scalesLrFinal = 0.00005f;
     bool keepCrs = false;
     float downscaleFactor = 1.0f;
     float bgColor[3] = {0.0f, 0.0f, 0.0f};  // black — matches Brush default for masked training

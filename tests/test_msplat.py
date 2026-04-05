@@ -27,6 +27,7 @@ def test_training_config_defaults():
     assert cfg.iterations == 30000
     assert cfg.sh_degree == 3
     assert cfg.ssim_weight == pytest.approx(0.2)
+    assert cfg.strategy == "classic"
     assert cfg.refine_every == 100
     assert cfg.warmup_length == 500
 
@@ -34,10 +35,11 @@ def test_training_config_defaults():
 def test_training_config_custom():
     from msplat import TrainingConfig
 
-    cfg = TrainingConfig(iterations=100, sh_degree=1, ssim_weight=0.0)
+    cfg = TrainingConfig(iterations=100, sh_degree=1, ssim_weight=0.0, strategy="hybrid")
     assert cfg.iterations == 100
     assert cfg.sh_degree == 1
     assert cfg.ssim_weight == 0.0
+    assert cfg.strategy == "hybrid"
 
 
 def test_training_config_mutable():
@@ -276,5 +278,49 @@ def test_checkpoint_resume_training():
         assert trainer2.iteration == 100
         assert stats.splat_count > 0
         assert stats.ms_per_step > 0
+    finally:
+        os.unlink(ckpt_path)
+
+
+@pytest.mark.skipif(not HAS_GARDEN, reason="garden dataset not found")
+def test_checkpoint_resume_igsplus():
+    """IGS+ checkpoint restore preserves the resume point."""
+    from msplat import TrainingConfig, Dataset, GaussianTrainer
+
+    ds = Dataset(GARDEN, downscale_factor=32.0)
+    cfg = TrainingConfig(
+        iterations=8,
+        num_downscales=0,
+        strategy="igsplus",
+        warmup_length=1,
+        refine_every=2,
+        max_splats=140000,
+    )
+
+    trainer_ref = GaussianTrainer(ds, cfg)
+    for _ in range(8):
+        trainer_ref.step()
+    expected_count = trainer_ref.splat_count
+
+    trainer = GaussianTrainer(ds, cfg)
+    for _ in range(6):
+        trainer.step()
+
+    with tempfile.NamedTemporaryFile(suffix=".msplat", delete=False) as f:
+        ckpt_path = f.name
+
+    try:
+        trainer.save_checkpoint(ckpt_path)
+
+        trainer2 = GaussianTrainer(ds, cfg)
+        trainer2.load_checkpoint(ckpt_path)
+        assert trainer2.iteration == 6
+        assert trainer2.splat_count == trainer.splat_count
+
+        for _ in range(2):
+            trainer2.step()
+
+        assert trainer2.iteration == 8
+        assert trainer2.splat_count == expected_count
     finally:
         os.unlink(ckpt_path)

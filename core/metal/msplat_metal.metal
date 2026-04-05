@@ -1719,15 +1719,23 @@ kernel void apply_mean_noise_kernel(
     constant float* quats [[buffer(5)]],        // [N,4]
     constant float* opacities [[buffer(6)]],    // [N,1] logit-space
     constant int* radii [[buffer(7)]],          // [N]
-    constant uint& step_seed [[buffer(8)]],     // step-based seed for GPU RNG
+    constant float* vis_counts [[buffer(8)]],   // [N] optional for MRNF mode
+    constant float& median_scale [[buffer(9)]],
+    constant uint& step_seed [[buffer(10)]],    // step-based seed for GPU RNG
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= (uint)N) return;
-    if (radii[idx] <= 0) return;
+    bool mrnf_mode = (vis_counts != nullptr);
+    if (mrnf_mode) {
+        if (vis_counts[idx] <= 0.0f) return;
+    } else {
+        if (radii[idx] <= 0) return;
+    }
 
     float alpha = 1.0f / (1.0f + exp(-opacities[idx]));
     float inv_alpha = clamp(1.0f - alpha, 0.0f, 1.0f);
-    float noise_scale = pow(inv_alpha, 32.0f) * lr_mean * mean_noise_weight;
+    float exponent = mrnf_mode ? 150.0f : 32.0f;
+    float noise_scale = pow(inv_alpha, exponent) * lr_mean * mean_noise_weight;
     if (noise_scale <= 0.0f) return;
 
     float sx = exp(scales[idx*3]);
@@ -1757,6 +1765,12 @@ kernel void apply_mean_noise_kernel(
     float v0 = (1-2*(qy*qy+qz*qz))*r0 + 2*(qx*qy-qw*qz)*r1 + 2*(qx*qz+qw*qy)*r2;
     float v1 = 2*(qx*qy+qw*qz)*r0 + (1-2*(qx*qx+qz*qz))*r1 + 2*(qy*qz-qw*qx)*r2;
     float v2 = 2*(qx*qz-qw*qy)*r0 + 2*(qy*qz+qw*qx)*r1 + (1-2*(qx*qx+qy*qy))*r2;
+
+    if (mrnf_mode && median_scale > 0.0f) {
+        v0 = clamp(v0, -median_scale, median_scale);
+        v1 = clamp(v1, -median_scale, median_scale);
+        v2 = clamp(v2, -median_scale, median_scale);
+    }
 
     means[idx*3]   += v0;
     means[idx*3+1] += v1;
@@ -3961,4 +3975,137 @@ kernel void hybrid_refine_kernel(
     for (int c = 0; c < 3; c++) { adam_ea3[donor*3+c] = 0; adam_es3[donor*3+c] = 0; }
     for (int c = 0; c < fr_stride; c++) { adam_ea4[donor*fr_stride+c] = 0; adam_es4[donor*fr_stride+c] = 0; }
     adam_ea5[donor] = 0; adam_es5[donor] = 0;
+}
+
+// ============================================================================
+// Long-axis split used by MRNF / IGS+.
+// One thread per selected donor. The first child overwrites the donor slot and
+// the second child is appended at dst_offset + j.
+// ============================================================================
+kernel void long_axis_split_kernel(
+    constant uint& num_splits        [[buffer(0)]],
+    constant int* donor_indices      [[buffer(1)]],   // [num_splits]
+    device float* means_buf          [[buffer(2)]],
+    device float* scales_buf         [[buffer(3)]],
+    device float* quats_buf          [[buffer(4)]],
+    device float* featuresDc_buf     [[buffer(5)]],
+    device float* featuresRest_buf   [[buffer(6)]],
+    device float* opacities_buf      [[buffer(7)]],
+    constant int& fr_stride          [[buffer(8)]],
+    constant uint& dst_offset        [[buffer(9)]],
+    device float* adam_ea0           [[buffer(10)]],
+    device float* adam_ea1           [[buffer(11)]],
+    device float* adam_ea2           [[buffer(12)]],
+    device float* adam_ea3           [[buffer(13)]],
+    device float* adam_ea4           [[buffer(14)]],
+    device float* adam_ea5           [[buffer(15)]],
+    device float* adam_es0           [[buffer(16)]],
+    device float* adam_es1           [[buffer(17)]],
+    device float* adam_es2           [[buffer(18)]],
+    device float* adam_es3           [[buffer(19)]],
+    device float* adam_es4           [[buffer(20)]],
+    device float* adam_es5           [[buffer(21)]],
+    uint j [[thread_position_in_grid]]
+) {
+    if (j >= num_splits) return;
+
+    constexpr float LOG_HALF = -0.6931471805599453f;
+    constexpr float LOG_MINOR = -0.16251892949777494f;
+
+    int donor = donor_indices[j];
+    int dst = (int)dst_offset + (int)j;
+
+    float parent_mean0 = means_buf[donor*3];
+    float parent_mean1 = means_buf[donor*3+1];
+    float parent_mean2 = means_buf[donor*3+2];
+
+    float sc0 = scales_buf[donor*3];
+    float sc1 = scales_buf[donor*3+1];
+    float sc2 = scales_buf[donor*3+2];
+    float sx = exp(sc0);
+    float sy = exp(sc1);
+    float sz = exp(sc2);
+
+    int longest = 0;
+    float longest_scale = sx;
+    if (sy > longest_scale) { longest = 1; longest_scale = sy; }
+    if (sz > longest_scale) { longest = 2; longest_scale = sz; }
+
+    float qw = quats_buf[donor*4];
+    float qx = quats_buf[donor*4+1];
+    float qy = quats_buf[donor*4+2];
+    float qz = quats_buf[donor*4+3];
+    float qlen = sqrt(qw*qw + qx*qx + qy*qy + qz*qz);
+    if (qlen > 1e-8f) {
+        qw /= qlen; qx /= qlen; qy /= qlen; qz /= qlen;
+    } else {
+        qw = 1.0f; qx = qy = qz = 0.0f;
+    }
+
+    float3 axis;
+    if (longest == 0) {
+        axis = float3(
+            1.0f - 2.0f*(qy*qy + qz*qz),
+            2.0f*(qx*qy + qw*qz),
+            2.0f*(qx*qz - qw*qy)
+        );
+    } else if (longest == 1) {
+        axis = float3(
+            2.0f*(qx*qy - qw*qz),
+            1.0f - 2.0f*(qx*qx + qz*qz),
+            2.0f*(qy*qz + qw*qx)
+        );
+    } else {
+        axis = float3(
+            2.0f*(qx*qz + qw*qy),
+            2.0f*(qy*qz - qw*qx),
+            1.0f - 2.0f*(qx*qx + qy*qy)
+        );
+    }
+
+    float3 offset = axis * (longest_scale * 0.5f);
+
+    means_buf[donor*3]   = parent_mean0 + offset.x;
+    means_buf[donor*3+1] = parent_mean1 + offset.y;
+    means_buf[donor*3+2] = parent_mean2 + offset.z;
+    means_buf[dst*3]     = parent_mean0 - offset.x;
+    means_buf[dst*3+1]   = parent_mean1 - offset.y;
+    means_buf[dst*3+2]   = parent_mean2 - offset.z;
+
+    float3 new_scales = float3(sc0 + LOG_MINOR, sc1 + LOG_MINOR, sc2 + LOG_MINOR);
+    if (longest == 0) new_scales.x = sc0 + LOG_HALF;
+    else if (longest == 1) new_scales.y = sc1 + LOG_HALF;
+    else new_scales.z = sc2 + LOG_HALF;
+
+    scales_buf[donor*3]   = new_scales.x;
+    scales_buf[donor*3+1] = new_scales.y;
+    scales_buf[donor*3+2] = new_scales.z;
+    scales_buf[dst*3]     = new_scales.x;
+    scales_buf[dst*3+1]   = new_scales.y;
+    scales_buf[dst*3+2]   = new_scales.z;
+
+    for (int c = 0; c < 4; c++) quats_buf[dst*4+c] = quats_buf[donor*4+c];
+    for (int c = 0; c < 3; c++) featuresDc_buf[dst*3+c] = featuresDc_buf[donor*3+c];
+    for (int c = 0; c < fr_stride; c++)
+        featuresRest_buf[dst*fr_stride+c] = featuresRest_buf[donor*fr_stride+c];
+
+    float parent_alpha = 1.0f / (1.0f + exp(-opacities_buf[donor]));
+    float child_alpha = clamp(parent_alpha * 0.6f, 1e-6f, 1.0f - 1e-6f);
+    float child_logit = log(child_alpha / (1.0f - child_alpha));
+    opacities_buf[donor] = child_logit;
+    opacities_buf[dst] = child_logit;
+
+    for (int c = 0; c < 3; c++) { adam_ea0[donor*3+c] = 0; adam_es0[donor*3+c] = 0; }
+    for (int c = 0; c < 3; c++) { adam_ea1[donor*3+c] = 0; adam_es1[donor*3+c] = 0; }
+    for (int c = 0; c < 4; c++) { adam_ea2[donor*4+c] = 0; adam_es2[donor*4+c] = 0; }
+    for (int c = 0; c < 3; c++) { adam_ea3[donor*3+c] = 0; adam_es3[donor*3+c] = 0; }
+    for (int c = 0; c < fr_stride; c++) { adam_ea4[donor*fr_stride+c] = 0; adam_es4[donor*fr_stride+c] = 0; }
+    adam_ea5[donor] = 0; adam_es5[donor] = 0;
+
+    for (int c = 0; c < 3; c++) { adam_ea0[dst*3+c] = 0; adam_es0[dst*3+c] = 0; }
+    for (int c = 0; c < 3; c++) { adam_ea1[dst*3+c] = 0; adam_es1[dst*3+c] = 0; }
+    for (int c = 0; c < 4; c++) { adam_ea2[dst*4+c] = 0; adam_es2[dst*4+c] = 0; }
+    for (int c = 0; c < 3; c++) { adam_ea3[dst*3+c] = 0; adam_es3[dst*3+c] = 0; }
+    for (int c = 0; c < fr_stride; c++) { adam_ea4[dst*fr_stride+c] = 0; adam_es4[dst*fr_stride+c] = 0; }
+    adam_ea5[dst] = 0; adam_es5[dst] = 0;
 }

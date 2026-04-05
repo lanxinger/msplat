@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <stdexcept>
 #include <iostream>
 #include <iomanip>
 #include <atomic>
@@ -94,14 +95,39 @@ int main(int argc, char *argv[]) {
     int noiseStopAt = 15000;
     app.add_option("--noise-stop-at", noiseStopAt, "Last training step that applies mean noise")
         ->check(CLI::Range(0, 1000000));
-    bool hybridRefine = false;
-    app.add_flag("--hybrid-refine", hybridRefine, "Brush-style hybrid refine: replace dup growth with donor recycling");
+    std::string strategyName = "classic";
+    app.add_option("--strategy", strategyName, "Training strategy: classic, hybrid, mrnf, igsplus")
+        ->check(CLI::IsMember({"classic", "hybrid", "mrnf", "igsplus"}));
     int maxSplats = 0;
     app.add_option("--max-splats", maxSplats, "Max splat count for hybrid refine (0 = no cap)")
         ->check(CLI::Range(0, 100000000));
     float hybridGrowthFloorDivisor = 33.0f;
     app.add_option("--hybrid-growth-floor-divisor", hybridGrowthFloorDivisor,
                    "Hybrid growth floor divisor (0 disables the floor; higher values reduce forced growth)")
+        ->check(CLI::Range(0.0f, 1000000.0f));
+    float growthGradThreshold = 0.003f;
+    app.add_option("--growth-grad-threshold", growthGradThreshold, "MRNF gradient threshold for growth selection")
+        ->check(CLI::Range(0.0f, 1000000.0f));
+    float growFraction = 0.07f;
+    app.add_option("--grow-fraction", growFraction, "MRNF fraction of above-threshold splats to grow")
+        ->check(CLI::Range(0.0f, 1.0f));
+    int growUntilIter = 15000;
+    app.add_option("--grow-until-iter", growUntilIter, "Last training step where MRNF growth runs")
+        ->check(CLI::Range(0, 100000000));
+    float opacityDecay = 0.004f;
+    app.add_option("--opacity-decay", opacityDecay, "MRNF per-refine opacity decay strength")
+        ->check(CLI::Range(0.0f, 1000000.0f));
+    float scaleDecay = 0.002f;
+    app.add_option("--scale-decay", scaleDecay, "MRNF per-refine scale decay strength")
+        ->check(CLI::Range(0.0f, 1.0f));
+    float boundsPercentile = 0.8f;
+    app.add_option("--bounds-percentile", boundsPercentile, "MRNF percentile used to estimate scene bounds")
+        ->check(CLI::Range(0.5f, 0.999f));
+    float scalesLrInit = 0.005f;
+    app.add_option("--scales-lr-init", scalesLrInit, "Initial MRNF scales learning rate")
+        ->check(CLI::Range(0.0f, 1000000.0f));
+    float scalesLrFinal = 0.00005f;
+    app.add_option("--scales-lr-final", scalesLrFinal, "Final MRNF scales learning rate")
         ->check(CLI::Range(0.0f, 1000000.0f));
     std::vector<float> bgColor = {0.6130f, 0.0101f, 0.3984f};
     auto *bgOpt = app.add_option("--bg-color", bgColor, "Background RGB (0-1), default magenta; auto-switches to black when masks detected")
@@ -113,6 +139,15 @@ int main(int argc, char *argv[]) {
         ->check(CLI::ExistingDirectory);
 
     CLI11_PARSE(app, argc, argv);
+
+    auto parseStrategy = [](const std::string &name) {
+        if (name == "classic") return Strategy::Classic;
+        if (name == "hybrid") return Strategy::Hybrid;
+        if (name == "mrnf") return Strategy::MRNF;
+        if (name == "igsplus") return Strategy::IGSPlus;
+        throw std::runtime_error("Invalid strategy: " + name);
+    };
+    Strategy strategy = parseStrategy(strategyName);
 
     if (validate || !valRender.empty()) validate = true;
     if (!valRender.empty() && !fs::exists(valRender)) fs::create_directories(valRender);
@@ -182,7 +217,10 @@ int main(int argc, char *argv[]) {
                      refineEvery, warmupLength, resetAlphaEvery, densifyGradThresh,
                      densifySizeThresh, stopScreenSizeAt, splitScreenSize,
                      numIters, keepCrs, meanNoiseWeight, noiseStopAt,
-                     hybridRefine, maxSplats, hybridGrowthFloorDivisor,
+                     strategy, maxSplats, hybridGrowthFloorDivisor,
+                     growthGradThreshold, growFraction, growUntilIter,
+                     opacityDecay, scaleDecay, boundsPercentile,
+                     scalesLrInit, scalesLrFinal,
                      bgColor.data());
         std::cout << " done" << std::endl;
 
