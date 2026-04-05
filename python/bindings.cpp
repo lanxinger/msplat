@@ -40,6 +40,7 @@ struct TrainingConfig {
     int noise_stop_at = 15000;
     bool hybrid_refine = false;
     int max_splats = 0;
+    float hybrid_growth_floor_divisor = 33.0f;
     bool keep_crs = false;
     float downscale_factor = 1.0f;
     std::string output = "splat.ply";
@@ -126,7 +127,7 @@ public:
             cfg.densify_grad_thresh, cfg.densify_size_thresh,
             cfg.stop_screen_size_at, cfg.split_screen_size,
             cfg.iterations, cfg.keep_crs, cfg.mean_noise_weight, cfg.noise_stop_at,
-            cfg.hybrid_refine, cfg.max_splats,
+            cfg.hybrid_refine, cfg.max_splats, cfg.hybrid_growth_floor_divisor,
             cfg.bg_color.data()
         );
 
@@ -310,7 +311,7 @@ NB_MODULE(_core, m) {
                 const std::string &output, int save_every,
                 std::vector<float> bg_color,
                 float mean_noise_weight, int noise_stop_at,
-                bool hybrid_refine, int max_splats) {
+                bool hybrid_refine, int max_splats, float hybrid_growth_floor_divisor) {
             new (cfg) TrainingConfig();
             cfg->iterations = iterations;
             cfg->sh_degree = sh_degree;
@@ -336,6 +337,7 @@ NB_MODULE(_core, m) {
             cfg->noise_stop_at = noise_stop_at;
             cfg->hybrid_refine = hybrid_refine;
             cfg->max_splats = max_splats;
+            cfg->hybrid_growth_floor_divisor = hybrid_growth_floor_divisor;
         },
             "iterations"_a = 30000,
             "sh_degree"_a = 3,
@@ -358,7 +360,8 @@ NB_MODULE(_core, m) {
             "mean_noise_weight"_a = 50.0f,
             "noise_stop_at"_a = 15000,
             "hybrid_refine"_a = false,
-            "max_splats"_a = 0)
+            "max_splats"_a = 0,
+            "hybrid_growth_floor_divisor"_a = 33.0f)
         .def_rw("iterations", &TrainingConfig::iterations)
         .def_rw("sh_degree", &TrainingConfig::sh_degree)
         .def_rw("sh_degree_interval", &TrainingConfig::sh_degree_interval)
@@ -376,6 +379,7 @@ NB_MODULE(_core, m) {
         .def_rw("noise_stop_at", &TrainingConfig::noise_stop_at)
         .def_rw("hybrid_refine", &TrainingConfig::hybrid_refine)
         .def_rw("max_splats", &TrainingConfig::max_splats)
+        .def_rw("hybrid_growth_floor_divisor", &TrainingConfig::hybrid_growth_floor_divisor)
         .def_rw("keep_crs", &TrainingConfig::keep_crs)
         .def_rw("downscale_factor", &TrainingConfig::downscale_factor)
         .def_rw("output", &TrainingConfig::output)

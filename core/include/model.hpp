@@ -14,7 +14,7 @@ struct Model{
         int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
         int refineEvery, int warmupLength, int resetAlphaEvery, float densifyGradThresh, float densifySizeThresh, int stopScreenSizeAt, float splitScreenSize,
         int maxSteps, bool keepCrs, float meanNoiseWeight, int noiseStopAt,
-        bool hybridRefine = false, int maxSplats = 0,
+        bool hybridRefine = false, int maxSplats = 0, float hybridGrowthFloorDivisor = 33.0f,
         const float* bgColor = nullptr);
 
   ~Model(){ releaseOptimizers(); }
@@ -101,6 +101,7 @@ struct Model{
   int noiseStopAt;
   bool hybridRefine;
   int maxSplats;
+  float hybridGrowthFloorDivisor;
   bool maskAwareData = false;
 
   float scale;

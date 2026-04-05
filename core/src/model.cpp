@@ -121,7 +121,7 @@ Model::Model(const InputData &inputData, int numCameras,
     int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
     int refineEvery, int warmupLength, int resetAlphaEvery, float densifyGradThresh, float densifySizeThresh, int stopScreenSizeAt, float splitScreenSize,
     int maxSteps, bool keepCrs, float meanNoiseWeight, int noiseStopAt,
-    bool hybridRefine, int maxSplats,
+    bool hybridRefine, int maxSplats, float hybridGrowthFloorDivisor,
     const float* bgColor)
     : numCameras(numCameras), numDownscales(numDownscales), resolutionSchedule(resolutionSchedule),
       shDegree(shDegree), shDegreeInterval(shDegreeInterval),
@@ -129,7 +129,8 @@ Model::Model(const InputData &inputData, int numCameras,
       stopSplitAt(maxSteps / 2), densifyGradThresh(densifyGradThresh), densifySizeThresh(densifySizeThresh),
       stopScreenSizeAt(stopScreenSizeAt), splitScreenSize(splitScreenSize),
       maxSteps(maxSteps), keepCrs(keepCrs), meanNoiseWeight(meanNoiseWeight), noiseStopAt(noiseStopAt),
-      hybridRefine(hybridRefine), maxSplats(maxSplats) {
+      hybridRefine(hybridRefine), maxSplats(maxSplats),
+      hybridGrowthFloorDivisor(hybridGrowthFloorDivisor) {
 
     int64_t numPoints = inputData.points.count;
     scale = inputData.scale;
@@ -392,7 +393,9 @@ void Model::afterTrain(int step){
                 // to match Brush's growth rate (~10K/step from 200K base).
                 static constexpr float GROWTH_SELECT_FRACTION = 0.2f;
                 int grad_growth = (int)(aboveThreshCount * GROWTH_SELECT_FRACTION + 0.5f);
-                int min_growth = num_active / 33;  // ~3% floor — reaches ~400K by stopSplitAt from 188K
+                int min_growth = 0;
+                if (hybridGrowthFloorDivisor > 0.0f)
+                    min_growth = (int)(num_active / hybridGrowthFloorDivisor);
                 int growth = std::max(grad_growth, min_growth);
                 int budget = freed + growth;
                 if (maxSplats > 0)

@@ -31,6 +31,7 @@ struct Config {
     int noiseStopAt = 15000;
     bool hybridRefine = false;
     int maxSplats = 0;
+    float hybridGrowthFloorDivisor = 33.0f;
     bool keepCrs = false;
     float downscaleFactor = 1.0f;
     float bgColor[3] = {0.0f, 0.0f, 0.0f};  // black — matches Brush default for masked training

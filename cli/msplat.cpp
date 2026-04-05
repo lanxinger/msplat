@@ -99,6 +99,10 @@ int main(int argc, char *argv[]) {
     int maxSplats = 0;
     app.add_option("--max-splats", maxSplats, "Max splat count for hybrid refine (0 = no cap)")
         ->check(CLI::Range(0, 100000000));
+    float hybridGrowthFloorDivisor = 33.0f;
+    app.add_option("--hybrid-growth-floor-divisor", hybridGrowthFloorDivisor,
+                   "Hybrid growth floor divisor (0 disables the floor; higher values reduce forced growth)")
+        ->check(CLI::Range(0.0f, 1000000.0f));
     std::vector<float> bgColor = {0.6130f, 0.0101f, 0.3984f};
     auto *bgOpt = app.add_option("--bg-color", bgColor, "Background RGB (0-1), default magenta; auto-switches to black when masks detected")
         ->expected(3);
@@ -178,7 +182,7 @@ int main(int argc, char *argv[]) {
                      refineEvery, warmupLength, resetAlphaEvery, densifyGradThresh,
                      densifySizeThresh, stopScreenSizeAt, splitScreenSize,
                      numIters, keepCrs, meanNoiseWeight, noiseStopAt,
-                     hybridRefine, maxSplats,
+                     hybridRefine, maxSplats, hybridGrowthFloorDivisor,
                      bgColor.data());
         std::cout << " done" << std::endl;
 
@@ -211,8 +215,8 @@ int main(int argc, char *argv[]) {
             MTensor *maskPtr = cam.hasMask() ? &cam.getGPUMask(model.getDownscaleFactor(step)) : nullptr;
             model.fullIteration(cam, step, gt, ssimWeight, maskPtr);
             model.schedulersStep(step);
-            model.afterTrain(step);
             model.applyMaskOpacityPenalty(cams, step);
+            model.afterTrain(step);
             msplat_commit();
 
             if (step % progressInterval == 0 || step == (size_t)numIters) {

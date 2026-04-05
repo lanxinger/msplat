@@ -31,6 +31,7 @@ typedef struct {
     int noiseStopAt;
     bool hybridRefine;
     int maxSplats;
+    float hybridGrowthFloorDivisor;
     bool keepCrs;
     float downscaleFactor;
     float bgColor[3];
@@ -55,6 +56,7 @@ static inline MsplatConfig msplat_default_config(void) {
     c.noiseStopAt = 15000;
     c.hybridRefine = false;
     c.maxSplats = 0;
+    c.hybridGrowthFloorDivisor = 33.0f;
     c.keepCrs = false;
     c.downscaleFactor = 1.0f;
     c.bgColor[0] = 0.0f; c.bgColor[1] = 0.0f; c.bgColor[2] = 0.0f;

@@ -137,7 +137,7 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
         config.densifyGradThresh, config.densifySizeThresh,
         config.stopScreenSizeAt, config.splitScreenSize,
         config.iterations, config.keepCrs, config.meanNoiseWeight, config.noiseStopAt,
-        config.hybridRefine, config.maxSplats,
+        config.hybridRefine, config.maxSplats, config.hybridGrowthFloorDivisor,
         config.bgColor
     );
 
@@ -425,6 +425,7 @@ static msplat::Config configFromC(MsplatConfig c) {
     cfg.noiseStopAt = c.noiseStopAt;
     cfg.hybridRefine = c.hybridRefine;
     cfg.maxSplats = c.maxSplats;
+    cfg.hybridGrowthFloorDivisor = c.hybridGrowthFloorDivisor;
     cfg.keepCrs = c.keepCrs;
     cfg.downscaleFactor = c.downscaleFactor;
     memcpy(cfg.bgColor, c.bgColor, sizeof(cfg.bgColor));

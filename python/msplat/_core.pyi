@@ -21,6 +21,7 @@ class TrainingConfig:
     noise_stop_at: int
     hybrid_refine: bool
     max_splats: int
+    hybrid_growth_floor_divisor: float
     keep_crs: bool
     downscale_factor: float
     output: str
@@ -52,6 +53,7 @@ class TrainingConfig:
         noise_stop_at: int = 15000,
         hybrid_refine: bool = False,
         max_splats: int = 0,
+        hybrid_growth_floor_divisor: float = 33.0,
     ) -> None: ...
 
 class TrainingStats:
