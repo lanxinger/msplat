@@ -923,14 +923,22 @@ MTensor msplat_render(
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background
 ) {
-    msplat_specialize_pipelines(degrees_to_use, false, get_global_context()->specialized_mip_splatting);
+    MetalContext* ctx = get_global_context();
+    msplat_specialize_pipelines(degrees_to_use, false, ctx->specialized_mip_splatting);
     MTensor dummyGt, dummyWindow;
     forward_pipeline(num_points, means3d, scales, glob_scale,
         quats, viewmat, projmat, fx, fy, cx, cy,
         img_height, img_width, tile_bounds, clip_thresh,
         degree, degrees_to_use, cam_pos, features_dc, features_rest,
         opacities, background, dummyGt, dummyWindow, 0.0f, false);
-    return g_tcache.out_img;
+
+    // out_img is GPU-private; schedule a blit copy to the readback buffer
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    assert(command_buffer && "Failed to retrieve command buffer reference");
+    dispatch_sync(ctx->d_queue, ^(){
+        encode_render_readback_copy(command_buffer, true, false);
+    });
+    return g_tcache.out_img_readback;
 }
 
 MTensor msplat_render_edge_scores(
