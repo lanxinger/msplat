@@ -941,13 +941,17 @@ Model::Model(const InputData &inputData, int numCameras,
         if (this->refineEvery == 100) this->refineEvery = 200;
         if (this->warmupLength == 500) this->warmupLength = 0;
         this->stopSplitAt = std::min(this->maxSteps, 28500);
+        // LichtFeld MRNF preset parity: growFraction 0.07, maxSplats 5M.
+        if (this->growFraction == 0.2f) this->growFraction = 0.07f;
+        if (this->maxSplats == 10000000) this->maxSplats = 5000000;
         if (scalesLrInit == 0.005f && scalesLrFinal == 0.00005f) {
             this->scaleLrCurrent = 7e-3f;
             this->scaleLrGamma = std::pow(5e-3 / 7e-3, 1.0 / std::max(1, this->maxSteps));
         }
     } else if (strategy == Strategy::IGSPlus) {
         if (this->refineEvery == 100 || this->refineEvery == 200) this->refineEvery = 500;
-        if (this->maxSplats <= 0) this->maxSplats = 4000000;
+        // LichtFeld IGS+ preset parity: maxSplats 4M (override global default too).
+        if (this->maxSplats <= 0 || this->maxSplats == 10000000) this->maxSplats = 4000000;
         this->stopSplitAt = std::min(this->maxSteps, 15000);
     }
 
