@@ -1,5 +1,113 @@
 # Changelog
 
+## v1.2 (pending) — Training strategies, mask-aware training, iOS support
+
+### Training strategies
+
+- **Strategy enum** — replaces the old `hybridRefine` boolean with an explicit
+  strategy selector across all API surfaces: `classic`, `hybrid`, `mrnf`, `igsplus`.
+  - Python: `TrainingConfig(strategy="mrnf")`
+  - Swift: `config.strategy = 2` (0=Classic, 1=Hybrid, 2=MRNF, 3=IGS+)
+  - C++/C: `config.strategy = 2`
+  - CLI: `--strategy mrnf`
+- **MRNF (Multi-Resolution Neural Fields)** — refine-window max-gradient accumulation,
+  bounds estimation, bounds-aware pruning, long-axis split growth, configurable opacity
+  and scale decay, continuous recycle, and dedicated means/scale LR scheduling.
+- **IGS+ (Improved Gaussian Splatting)** — budget schedule computation, error-score
+  accumulation, weighted donor sampling without replacement, long-axis-split-based
+  growth, prune/reset behavior, and its own LR decay rule. Requires `maxSplats`.
+- **Long-axis split kernel** — new Metal compute kernel for MRNF and IGS+ growth that
+  splits gaussians along their longest axis. Includes native regression test covering
+  transform symmetry, scale updates, opacity updates, and optimizer-state zeroing.
+- **Hybrid refinement improvements** — growth floor control, improved mask-aware opacity
+  suppression with background penalty gradients.
+- **Checkpoint format v2** — stores strategy-aware runtime state for MRNF and IGS+ so
+  resume behavior is correct. Backward-compatible with v1 checkpoints.
+
+### Mask-aware training
+
+- **Per-pixel mask support** — masks (white=keep, black=ignore) are auto-discovered from
+  a sibling `masks/` directory or specified via `--mask-dir`. Full pipeline:
+  - CoreGraphics loader with luminance conversion (handles colored masks)
+  - Undistortion through the same Brown-Conrady lens model as images
+  - GPU upload and Metal shader integration: mask multiplied into both loss and gradient
+  - Mask dimension validation with auto-resize on mismatch
+- **Mask-weighted metrics** — PSNR, L1, and SSIM evaluation compute foreground-only
+  quality. SSIM computes full Gaussian-window statistics on unmodified images, then
+  masks the final per-pixel average to avoid corrupting blur statistics at boundaries.
+- **SSIM backward mask pre-weighting** — pre-masks derivative fields before the backward
+  convolution pass, preventing gradient bleed from masked-out regions.
+- **SSIM backward background penalty** — soft `(1-mask)²` penalty pushes rendered values
+  toward background color in masked-out regions.
+- **Mask opacity penalty** — projects each splat center into a random subset of cameras
+  (up to 8), penalizes opacity for splats consistently in background regions.
+- **Auto black background** — when masks are detected and `--bg-color` is not explicitly
+  set, automatically switches to black background.
+
+### Alpha-channel rendering
+
+- **`msplat_get_render_alpha`** — new API to read per-pixel alpha (1−T) from the most
+  recent rasterizer pass.
+- **Premultiplied RGBA buffer output** — `renderFromPoseToBuffer` and
+  `renderWithFovToBuffer` output premultiplied-alpha RGBA for compositing, while
+  `render` and `renderFromPose` continue to return RGB float32 buffers.
+
+### iOS support
+
+- **iOS cross-compilation** — `build-xcframework.sh` now builds both macOS and iOS arm64
+  slices. Separate metallib resources per platform, selected at runtime via `#if os(iOS)`.
+- **iOS demo app** (`demo-ios/`) — SwiftUI app demonstrating dataset loading from Files,
+  training with progress, and real-time orbit rendering.
+- **Swift package** gains iOS platform support and Accelerate framework linkage.
+
+### Render API extensions
+
+- **`renderWithFovToBuffer`** — render from a camera-to-world matrix at arbitrary
+  resolution using a vertical FOV angle. Available in C++, C API, and Swift.
+- **`renderWithIntrinsicsToBuffer`** — render with explicit intrinsics (fx, fy, cx, cy).
+  Available in C++.
+- Useful for orbit rendering at display-native resolution without a reference camera.
+
+### Performance
+
+- **Accelerate framework for image I/O** — `vDSP`/`cblas` for RGBA-to-float conversion,
+  `vImage` for image/mask resizing, `CGImageSource` thumbnail API for subsample decode
+  at reduced resolution.
+- **Parallel camera loading** — `dispatch_apply` on GCD concurrent queue for image
+  decoding (~5–8× speedup on M-series).
+- **Parallel undistortion** — row-level GCD parallelism for Brown-Conrady undistortion.
+- **Parallel KNN scales** — `dispatch_apply` for initial Gaussian scale computation from
+  k-nearest-neighbor distances.
+- **GPU pre-warming** — pre-warm GPU image caches at all progressive resolution levels
+  after loading, then free CPU copies to reduce peak memory.
+- **`maxCameras` parameter** — evenly subsample large datasets to cap memory usage.
+- **Per-tile sort limit raised to 4096** — supports denser scenes (was 2048).
+
+### Bug fixes
+
+- **MTensor memory leak** — `__bridge_retained` → `__bridge` in allocator. `newBufferWithLength`
+  already returns +1; the extra retain caused a leak since `CFRelease` only releases once.
+- **Stack buffer overflow in KNN** — fixed for k > 4 by using `constexpr kMaxK = 16` for
+  stack-allocated scratch buffers (was hardcoded to 4).
+- **Dummy mask buffer leak** — cached the 1-element Metal buffer in `FusedTensorCache`
+  instead of allocating a new `gpu_empty({1})` every iteration.
+- **cam_pos alignment** — padded from `float[3]` to `float[4]` to satisfy Metal alignment.
+- **Exception propagation in parallel loading** — `dispatch_apply` workers now capture
+  exceptions via `std::exception_ptr` and rethrow after completion.
+- **Demo autorelease leak** — wrapped orbit loop iterations in `autoreleasepool` to drain
+  Metal command buffer autoreleases (fixed silent termination after ~5 minutes).
+- **Metal shader warnings** — fixed 7 signed/unsigned comparisons and zero-initialized
+  SIMD broadcast variables in rasterize backward kernels.
+
+### Infrastructure
+
+- **MTensor rule-of-five** — GPU-allocated tensors now own their Metal buffer and release
+  it on destruction. Copies are non-owning aliases, moves transfer ownership.
+- **CLI progress output** — stage-level progress messages (dataset loading, image loading,
+  model init, training every 5%, saving).
+- **Demo app improvements** — dataset picker UI (replaces hardcoded path), ported from
+  C API to Swift bindings, frame-dropping for render thread backlog.
+
 ## v1.1.3 — Fused kernels + pre-allocated tile bins
 
 - **Fused SH backward into Adam optimizer** — spherical harmonics gradients are now

@@ -53,8 +53,8 @@ static inline MsplatConfig msplat_default_config(void) {
     c.ssimWeight = 0.2f;
     c.numDownscales = 2;
     c.resolutionSchedule = 3000;
-    c.refineEvery = 100;
-    c.warmupLength = 500;
+    c.refineEvery = 200;
+    c.warmupLength = 0;
     c.resetAlphaEvery = 30;
     c.densifyGradThresh = 0.0002f;
     c.densifySizeThresh = 0.01f;
@@ -63,10 +63,10 @@ static inline MsplatConfig msplat_default_config(void) {
     c.meanNoiseWeight = 50.0f;
     c.noiseStopAt = 15000;
     c.strategy = 0;
-    c.maxSplats = 0;
-    c.hybridGrowthFloorDivisor = 33.0f;
+    c.maxSplats = 10000000;
+    c.hybridGrowthFloorDivisor = 0.0f;
     c.growthGradThreshold = 0.003f;
-    c.growFraction = 0.07f;
+    c.growFraction = 0.2f;
     c.growUntilIter = 15000;
     c.opacityDecay = 0.004f;
     c.scaleDecay = 0.002f;

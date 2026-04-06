@@ -75,7 +75,7 @@ int main(int argc, char *argv[]) {
         ->check(CLI::Range(0.0f, 1.0f));
     int refineEvery = 200;
     app.add_option("--refine-every", refineEvery, "Densify/prune every N steps");
-    int warmupLength = 500;
+    int warmupLength = 0;
     app.add_option("--warmup-length", warmupLength, "Steps before first densification");
     int resetAlphaEvery = 30;
     app.add_option("--reset-alpha-every", resetAlphaEvery, "Reset opacity every N refinements");
@@ -98,17 +98,17 @@ int main(int argc, char *argv[]) {
     std::string strategyName = "classic";
     app.add_option("--strategy", strategyName, "Training strategy: classic, hybrid, mrnf, igsplus")
         ->check(CLI::IsMember({"classic", "hybrid", "mrnf", "igsplus"}));
-    int maxSplats = 1000000;
+    int maxSplats = 10000000;
     app.add_option("--max-splats", maxSplats, "Max splat count (0 = no cap)")
         ->check(CLI::Range(0, 100000000));
-    float hybridGrowthFloorDivisor = 33.0f;
+    float hybridGrowthFloorDivisor = 0.0f;
     app.add_option("--hybrid-growth-floor-divisor", hybridGrowthFloorDivisor,
                    "Hybrid growth floor divisor (0 disables the floor; higher values reduce forced growth)")
         ->check(CLI::Range(0.0f, 1000000.0f));
     float growthGradThreshold = 0.003f;
     app.add_option("--growth-grad-threshold", growthGradThreshold, "MRNF gradient threshold for growth selection")
         ->check(CLI::Range(0.0f, 1000000.0f));
-    float growFraction = 0.07f;
+    float growFraction = 0.2f;
     app.add_option("--grow-fraction", growFraction, "MRNF fraction of above-threshold splats to grow")
         ->check(CLI::Range(0.0f, 1.0f));
     int growUntilIter = 15000;

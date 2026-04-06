@@ -43,7 +43,7 @@ struct TrainingConfig {
     int num_downscales = 2;
     int resolution_schedule = 3000;
     int refine_every = 200;
-    int warmup_length = 500;
+    int warmup_length = 0;
     int reset_alpha_every = 30;
     float densify_grad_thresh = 0.0002f;
     float densify_size_thresh = 0.01f;
@@ -52,10 +52,10 @@ struct TrainingConfig {
     float mean_noise_weight = 50.0f;
     int noise_stop_at = 15000;
     std::string strategy = "classic";
-    int max_splats = 1000000;
-    float hybrid_growth_floor_divisor = 33.0f;
+    int max_splats = 10000000;
+    float hybrid_growth_floor_divisor = 0.0f;
     float growth_grad_threshold = 0.003f;
-    float grow_fraction = 0.07f;
+    float grow_fraction = 0.2f;
     int grow_until_iter = 15000;
     float opacity_decay = 0.004f;
     float scale_decay = 0.002f;
@@ -66,8 +66,7 @@ struct TrainingConfig {
     float downscale_factor = 1.0f;
     std::string output = "splat.ply";
     int save_every = -1;
-    // Magenta default — high contrast against typical scenes, makes
-    // under-reconstructed regions obvious during training.
+    // Default black, matching Brush-style masked training.
     std::vector<float> bg_color = {0.0f, 0.0f, 0.0f};
 };
 
@@ -382,7 +381,7 @@ NB_MODULE(_core, m) {
             "num_downscales"_a = 2,
             "resolution_schedule"_a = 3000,
             "refine_every"_a = 200,
-            "warmup_length"_a = 500,
+            "warmup_length"_a = 0,
             "reset_alpha_every"_a = 30,
             "densify_grad_thresh"_a = 0.0002f,
             "densify_size_thresh"_a = 0.01f,
@@ -396,10 +395,10 @@ NB_MODULE(_core, m) {
             "mean_noise_weight"_a = 50.0f,
             "noise_stop_at"_a = 15000,
             "strategy"_a = "classic",
-            "max_splats"_a = 1000000,
-            "hybrid_growth_floor_divisor"_a = 33.0f,
+            "max_splats"_a = 10000000,
+            "hybrid_growth_floor_divisor"_a = 0.0f,
             "growth_grad_threshold"_a = 0.003f,
-            "grow_fraction"_a = 0.07f,
+            "grow_fraction"_a = 0.2f,
             "grow_until_iter"_a = 15000,
             "opacity_decay"_a = 0.004f,
             "scale_decay"_a = 0.002f,

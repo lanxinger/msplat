@@ -20,8 +20,8 @@ struct Config {
     float ssimWeight = 0.2f;
     int numDownscales = 2;
     int resolutionSchedule = 3000;
-    int refineEvery = 100;
-    int warmupLength = 500;
+    int refineEvery = 200;
+    int warmupLength = 0;
     int resetAlphaEvery = 30;
     float densifyGradThresh = 0.0002f;
     float densifySizeThresh = 0.01f;
@@ -30,10 +30,10 @@ struct Config {
     float meanNoiseWeight = 50.0f;
     int noiseStopAt = 15000;
     int strategy = 0;  // 0=Classic, 1=Hybrid, 2=MRNF, 3=IGSPlus
-    int maxSplats = 0;
-    float hybridGrowthFloorDivisor = 33.0f;
+    int maxSplats = 10000000;
+    float hybridGrowthFloorDivisor = 0.0f;
     float growthGradThreshold = 0.003f;
-    float growFraction = 0.07f;
+    float growFraction = 0.2f;
     int growUntilIter = 15000;
     float opacityDecay = 0.004f;
     float scaleDecay = 0.002f;

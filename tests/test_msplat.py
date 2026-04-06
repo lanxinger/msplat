@@ -29,7 +29,7 @@ def test_training_config_defaults():
     assert cfg.ssim_weight == pytest.approx(0.2)
     assert cfg.strategy == "classic"
     assert cfg.refine_every == 200
-    assert cfg.warmup_length == 500
+    assert cfg.warmup_length == 0
 
 
 def test_training_config_custom():
