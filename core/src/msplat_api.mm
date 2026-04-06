@@ -309,16 +309,17 @@ void Trainer::renderFromPoseToBuffer(const float camToWorld[16], int refCameraIn
     cam.cachedProjViewMat = MTensor();
 
     MTensor rgb = impl->model->render(cam, impl->currentStep);
-    msplat_gpu_sync();
-
     int h = (int)rgb.size(0), w = (int)rgb.size(1);
     *outWidth = w;
     *outHeight = h;
-    if (!outRGBA) return;
+    if (!outRGBA) {
+        msplat_gpu_sync();
+        return;
+    }
 
     const float* bg = (const float*)impl->model->backgroundColor.data_ptr();
-    int n = w * h;
-    msplat_copy_last_render_rgba(outRGBA, n, bg);
+    msplat_pack_last_render_rgba(outRGBA, w, h, bg);
+    msplat_gpu_sync();
 }
 
 void Trainer::renderWithIntrinsicsToBuffer(const float camToWorld[16],
@@ -331,15 +332,16 @@ void Trainer::renderWithIntrinsicsToBuffer(const float camToWorld[16],
 
     // Use config.iterations as step to ensure downscale factor = 1
     MTensor rgb = impl->model->render(cam, impl->config.iterations);
-    msplat_gpu_sync();
-
     int h = (int)rgb.size(0), w = (int)rgb.size(1);
     *outWidth = w; *outHeight = h;
-    if (!outRGBA) return;
+    if (!outRGBA) {
+        msplat_gpu_sync();
+        return;
+    }
 
     const float* bg = (const float*)impl->model->backgroundColor.data_ptr();
-    int n = w * h;
-    msplat_copy_last_render_rgba(outRGBA, n, bg);
+    msplat_pack_last_render_rgba(outRGBA, w, h, bg);
+    msplat_gpu_sync();
 }
 
 void Trainer::renderWithFovToBuffer(const float camToWorld[16],

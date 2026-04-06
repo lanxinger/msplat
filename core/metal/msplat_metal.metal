@@ -415,6 +415,23 @@ inline void write_packed_float4(device float* arr, int idx, float4 val) {
     arr[4*idx+3] = val.w;
 }
 
+kernel void pack_last_render_rgba8_kernel(
+    constant uint& pixel_count [[buffer(0)]],
+    constant float* out_img [[buffer(1)]],
+    constant float* final_Ts [[buffer(2)]],
+    constant float4& bg [[buffer(3)]],
+    device uchar4* out_rgba [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= pixel_count) return;
+
+    float a = clamp(1.0f - final_Ts[gid], 0.0f, 1.0f);
+    float one_minus_a = 1.0f - a;
+    float3 rgb = read_packed_float3(out_img, gid) - one_minus_a * bg.xyz;
+    float4 premul = clamp(float4(rgb, a), 0.0f, 1.0f);
+    out_rgba[gid] = uchar4(premul * 255.0f);
+}
+
 // Forward projection: one thread per gaussian. Computes 2D position, conic, radius.
 kernel void project_gaussians_forward_kernel(
     constant int& num_points,

@@ -61,6 +61,42 @@ final class MsplatTests: XCTestCase {
         XCTAssertEqual(rendered.pixels.count, rendered.width * rendered.height * 3)
     }
 
+    func testRenderToRGBABuffer() throws {
+        let dataset = GaussianDataset(
+            path: Self.gardenPath,
+            downscaleFactor: 4.0
+        )
+        var config = TrainingConfig()
+        config.iterations = 5
+        config.numDownscales = 0
+
+        let trainer = GaussianTrainer(dataset: dataset, config: config)
+        for _ in 0..<5 { trainer.step() }
+
+        let pose = dataset.cameraPose(at: 0)
+        var width: Int32 = 0
+        var height: Int32 = 0
+        trainer.renderFromPoseToBuffer(camToWorld: pose, rgba: nil, width: &width, height: &height)
+
+        XCTAssertGreaterThan(width, 0)
+        XCTAssertGreaterThan(height, 0)
+
+        let pixelCount = Int(width * height)
+        var rgba = [UInt8](repeating: 0, count: pixelCount * 4)
+        rgba.withUnsafeMutableBufferPointer { ptr in
+            trainer.renderFromPoseToBuffer(
+                camToWorld: pose,
+                rgba: ptr.baseAddress,
+                width: &width,
+                height: &height
+            )
+        }
+
+        XCTAssertEqual(rgba.count, pixelCount * 4)
+        XCTAssertTrue(rgba.contains(where: { $0 != 0 }))
+        XCTAssertTrue(stride(from: 3, to: rgba.count, by: 4).contains { rgba[$0] > 0 })
+    }
+
     func testExportPly() throws {
         let dataset = GaussianDataset(
             path: Self.gardenPath,

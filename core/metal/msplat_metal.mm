@@ -159,6 +159,7 @@ struct MetalContext {
     id<MTLComputePipelineState> fused_adam_kernel_cpso;
     id<MTLComputePipelineState> accumulate_grad_stats_kernel_cpso;
     id<MTLComputePipelineState> apply_mean_noise_kernel_cpso;
+    id<MTLComputePipelineState> pack_last_render_rgba8_kernel_cpso;
     // GPU densification kernels
     id<MTLComputePipelineState> densify_classify_kernel_cpso;
     id<MTLComputePipelineState> densify_append_split_kernel_cpso;
@@ -313,6 +314,7 @@ MetalContext* init_msplat_metal_context() {
     [init_fcv release];
     ctx->accumulate_grad_stats_kernel_cpso        = load(@"accumulate_grad_stats_kernel");
     ctx->apply_mean_noise_kernel_cpso             = load(@"apply_mean_noise_kernel");
+    ctx->pack_last_render_rgba8_kernel_cpso       = load(@"pack_last_render_rgba8_kernel");
     // GPU densification
     ctx->densify_classify_kernel_cpso             = load(@"densify_classify_kernel");
     ctx->densify_append_split_kernel_cpso         = load(@"densify_append_split_kernel");
@@ -1046,20 +1048,41 @@ void msplat_get_render_alpha(float* out, int n) {
     for (int i = 0; i < n; i++) out[i] = 1.0f - t[i];
 }
 
-void msplat_copy_last_render_rgba(uint8_t* outRGBA, int n, const float bg[3]) {
-    const float *rgb = g_tcache.out_img.data<float>();
-    const float *t = g_tcache.final_Ts.data<float>();
-    for (int i = 0; i < n; i++) {
-        float a = fminf(fmaxf(1.0f - t[i], 0.f), 1.f);
-        float one_minus_a = 1.0f - a;
-        float r = rgb[i * 3]     - one_minus_a * bg[0];
-        float g = rgb[i * 3 + 1] - one_minus_a * bg[1];
-        float b = rgb[i * 3 + 2] - one_minus_a * bg[2];
-        outRGBA[i * 4]     = (uint8_t)(fminf(fmaxf(r, 0.f), 1.f) * 255.f);
-        outRGBA[i * 4 + 1] = (uint8_t)(fminf(fmaxf(g, 0.f), 1.f) * 255.f);
-        outRGBA[i * 4 + 2] = (uint8_t)(fminf(fmaxf(b, 0.f), 1.f) * 255.f);
-        outRGBA[i * 4 + 3] = (uint8_t)(a * 255.f);
-    }
+void msplat_pack_last_render_rgba(uint8_t* outRGBA, int width, int height, const float bg[3]) {
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    assert(command_buffer && "Failed to retrieve command buffer reference");
+
+    const uint32_t pixel_count = (uint32_t)width * (uint32_t)height;
+    const NSUInteger length = (NSUInteger)pixel_count * 4;
+    id<MTLBuffer> out_buffer = [ctx->device newBufferWithBytesNoCopy:outRGBA
+                                                              length:length
+                                                             options:MTLResourceStorageModeShared
+                                                         deallocator:nil];
+    assert(out_buffer && "Failed to wrap output RGBA buffer");
+
+    const std::array<float, 4> bg_rgba = {bg[0], bg[1], bg[2], 0.0f};
+
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        assert(encoder && "Failed to create compute command encoder");
+
+        [encoder setComputePipelineState:ctx->pack_last_render_rgba8_kernel_cpso];
+        ENC_SCALAR(encoder, pixel_count, 0);
+        ENC_BUF(encoder, g_tcache.out_img, 1);
+        ENC_BUF(encoder, g_tcache.final_Ts, 2);
+        [encoder setBytes:bg_rgba.data() length:sizeof(bg_rgba) atIndex:3];
+        [encoder setBuffer:out_buffer offset:0 atIndex:4];
+
+        NSUInteger tpg = MIN(ctx->pack_last_render_rgba8_kernel_cpso.maxTotalThreadsPerThreadgroup,
+                             (NSUInteger)pixel_count);
+        if (tpg == 0) tpg = 1;
+        [encoder dispatchThreads:MTLSizeMake(pixel_count, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [encoder endEncoding];
+    });
+
+    [out_buffer release];
 }
 
 MTensor msplat_train_step(
