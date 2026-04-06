@@ -21,8 +21,23 @@
   transform symmetry, scale updates, opacity updates, and optimizer-state zeroing.
 - **Hybrid refinement improvements** — growth floor control, improved mask-aware opacity
   suppression with background penalty gradients.
+- **MRNF/IGS+ LichtFeld preset parity** — selecting a strategy auto-adjusts defaults to
+  match LichtFeld Studio: MRNF sets `growFraction` 0.07, `maxSplats` 5M, `refineEvery` 200,
+  and schedules scale LR; IGS+ sets `refineEvery` 500, `maxSplats` 4M. Explicit overrides
+  are preserved.
 - **Checkpoint format v2** — stores strategy-aware runtime state for MRNF and IGS+ so
   resume behavior is correct. Backward-compatible with v1 checkpoints.
+
+### Quality & convergence
+
+- **Mip-splatting** — `--mip-splatting` flag enables anti-aliased rendering with a reduced
+  2D covariance filter (0.1 vs 0.3) and opacity compensation for the smaller blur. Implemented
+  via Metal function constant for zero overhead when disabled.
+- **Aux loss schedule** — final 10% of training automatically switches to pure L1 loss
+  (SSIM weight → 0) for tighter per-pixel convergence (matches Brush `aux_loss_time=0.9`).
+- **Background noise augmentation** — per-step random perturbation (±0.1) to the background
+  color prevents splats from baking in a fixed background. Seeded per step for
+  reproducibility.
 
 ### Mask-aware training
 
@@ -82,6 +97,19 @@
   after loading, then free CPU copies to reduce peak memory.
 - **`maxCameras` parameter** — evenly subsample large datasets to cap memory usage.
 - **Per-tile sort limit raised to 4096** — supports denser scenes (was 2048).
+- **Lazy image loading** — cameras initialize with metadata only (intrinsics, dimensions,
+  undistortion parameters). Pixel data is decoded from disk on demand via `reloadImage()`
+  and released after GPU upload with `releaseCPUData()`, reducing peak CPU memory for
+  large datasets.
+- **Metal pipeline specialization** — forward and backward compute pipelines use Metal
+  function constants (`fc_degrees_to_use`, `fc_has_mask`, `fc_mip_splatting`) for
+  compile-time dead-code elimination. Pipelines are re-specialized when SH degree or
+  mip-splatting mode changes.
+- **Half-precision SSIM intermediates** — SSIM horizontal-pass statistics and backward
+  derivative fields are stored as `half` (float16), halving intermediate buffer memory
+  between the separable passes.
+- **Loss readback removal** — eliminated unnecessary GPU→CPU synchronization for per-step
+  loss values.
 
 ### Bug fixes
 

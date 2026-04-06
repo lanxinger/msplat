@@ -2,7 +2,7 @@
 
 A 3D Gaussian Splatting training engine for Apple Silicon (macOS and iOS), built entirely on Metal. No external dependencies beyond system frameworks.
 
-The entire training pipeline: projection, sorting, rasterization, SSIM loss, backward pass, Adam optimizer, and densification runs as fused Metal compute shaders. Four training strategies are supported: Classic 3DGS, Hybrid refinement, MRNF, and IGS+. Per-pixel mask-aware training enables object-centric reconstruction.
+The entire training pipeline: projection, sorting, rasterization, SSIM loss, backward pass, Adam optimizer, and densification runs as fused Metal compute shaders. Four training strategies are supported: Classic 3DGS, Hybrid refinement, MRNF, and IGS+. Per-pixel mask-aware training enables object-centric reconstruction. Optional mip-splatting provides anti-aliased rendering with opacity compensation.
 
 The result is a self-contained engine that trains a full-resolution Mip-NeRF 360 scene in ~70 seconds and renders it at ~350 FPS on an M4 Max.
 
@@ -70,6 +70,8 @@ Densification (strategy-dependent):
 
 **Depth-chunked rasterization.** For tiles with extreme gaussian counts, the forward pass splits into 512-gaussian chunks with a merge kernel that reconstructs absolute transmittance. The backward pass uses precomputed prefix/suffix transmittance to avoid re-traversal.
 
+**Mip-splatting.** Optional anti-aliased rendering (`--mip-splatting`) reduces the 2D covariance filter from 0.3 to 0.1 and compensates opacity for the smaller blur. Implemented as a Metal function constant, so disabled scenes pay zero overhead.
+
 ## Installation & Usage
 
 ### Python
@@ -103,6 +105,9 @@ img = trainer.render_from_pose(pose)  # numpy (H, W, 3) float32 RGB
 
 # Training strategies: "classic" (default), "hybrid", "mrnf", "igsplus"
 config = msplat.TrainingConfig(strategy="mrnf", iterations=30000)
+
+# Anti-aliased rendering
+config = msplat.TrainingConfig(mip_splatting=True)
 
 # Mask-aware training (auto-discovers masks/ directory next to images/)
 dataset = msplat.load_dataset("path/to/colmap/", eval_mode=True)
