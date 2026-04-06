@@ -507,7 +507,7 @@ struct FusedTensorCache {
             fwd_num_points = np;
             xys = mtensor_empty_private(dev, {np, 2}, DType::Float32);
             depths = mtensor_empty_private(dev, {np}, DType::Float32);
-            radii_out = mtensor_empty(dev, {np}, DType::Int32);
+            radii_out = mtensor_empty_private(dev, {np}, DType::Int32);
             conics = mtensor_empty_private(dev, {np, 3}, DType::Float32);
             num_tiles_hit = mtensor_empty_private(dev, {np}, DType::Int32);
             colors = mtensor_empty_private(dev, {np, 3}, DType::Float32);
