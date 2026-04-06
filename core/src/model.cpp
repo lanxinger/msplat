@@ -1738,7 +1738,7 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight, 
     int densificationMode = strategy == Strategy::Hybrid ? 2 : (strategyUsesHybridRefine(strategy) ? 1 : 0);
     MTensor trainBackground = backgroundColor;
 
-    auto [r, loss] = msplat_train_step(
+    MTensor r = msplat_train_step(
         numPoints, means, scales, 1.0f,
         quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
         s.height, s.width, s.tileBounds, 0.01f,

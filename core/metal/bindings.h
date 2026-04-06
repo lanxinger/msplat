@@ -59,9 +59,9 @@ MTensor msplat_render_edge_scores(
     MTensor &opacities, MTensor &edge_map
 );
 
-// Fused forward + backward + Adam + grad_stats in one encoder
-// Returns: (radii [N], loss_value float)
-std::tuple<MTensor, float> msplat_train_step(
+// Fused forward + backward + Adam + grad_stats in one encoder.
+// Returns: radii [N].
+MTensor msplat_train_step(
     int num_points, MTensor &means3d, MTensor &scales, float glob_scale,
     MTensor &quats, MTensor &viewmat, MTensor &projmat,
     float fx, float fy, float cx, float cy,

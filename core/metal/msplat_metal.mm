@@ -948,7 +948,7 @@ void msplat_get_render_alpha(float* out, int n) {
     for (int i = 0; i < n; i++) out[i] = 1.0f - t[i];
 }
 
-std::tuple<MTensor, float> msplat_train_step(
+MTensor msplat_train_step(
     int num_points, MTensor &means3d, MTensor &scales, float glob_scale,
     MTensor &quats, MTensor &viewmat, MTensor &projmat,
     float fx, float fy, float cx, float cy,
@@ -1511,10 +1511,7 @@ std::tuple<MTensor, float> msplat_train_step(
         });
     }
 
-    // Ensure GPU has finished writing loss_sum before CPU reads it
-    ctx->syncCB();
-    float loss_val = *loss_sum.data<float>() / (float)(img_height * img_width);
-    return std::make_tuple(radii_out, loss_val);
+    return radii_out;
 }
 
 // ============================================================================
