@@ -159,6 +159,7 @@ struct MetalContext {
     id<MTLComputePipelineState> fused_adam_kernel_cpso;
     id<MTLComputePipelineState> accumulate_grad_stats_kernel_cpso;
     id<MTLComputePipelineState> apply_mean_noise_kernel_cpso;
+    id<MTLComputePipelineState> fill_gaussian_random_samples_kernel_cpso;
     id<MTLComputePipelineState> pack_last_render_rgba8_kernel_cpso;
     // GPU densification kernels
     id<MTLComputePipelineState> densify_classify_kernel_cpso;
@@ -314,6 +315,7 @@ MetalContext* init_msplat_metal_context() {
     [init_fcv release];
     ctx->accumulate_grad_stats_kernel_cpso        = load(@"accumulate_grad_stats_kernel");
     ctx->apply_mean_noise_kernel_cpso             = load(@"apply_mean_noise_kernel");
+    ctx->fill_gaussian_random_samples_kernel_cpso = load(@"fill_gaussian_random_samples_kernel");
     ctx->pack_last_render_rgba8_kernel_cpso       = load(@"pack_last_render_rgba8_kernel");
     // GPU densification
     ctx->densify_classify_kernel_cpso             = load(@"densify_classify_kernel");
@@ -1734,7 +1736,7 @@ int msplat_densify(
     MTensor &keep_flag, MTensor &keep_prefix,
     MTensor &block_totals, MTensor &compact_scratch,
     MTensor &keep_count_readback,
-    MTensor &random_samples,
+    uint32_t sample_seed,
     int skip_dup
 ) {
     MetalContext* ctx = get_global_context();
@@ -1766,6 +1768,8 @@ int msplat_densify(
 
     uint32_t N_u32 = (uint32_t)N;
     uint32_t K = (uint32_t)((N + 1023) / 1024);  // threadgroups for prefix sum on N elements
+    uint32_t split_random_count = (uint32_t)(2 * N);
+    MTensor split_random_samples = gpu_empty_private({(int64_t)split_random_count, 3}, DType::Float32);
     int check_screen_int = check_screen;
     int check_huge_int = check_huge;
     NSUInteger prefix_tpg = MIN(ctx->prefix_sum_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)1024);
@@ -1828,14 +1832,26 @@ int msplat_densify(
         // ---- Stage 3: Prefix sum on dup_flag → dup_prefix ----
         encode_block_prefix(N_u32, K, dup_flag, dup_prefix);
 
-        // ---- Stage 4: Append split children ----
+        // ---- Stage 4: Generate Gaussian offsets for split children ----
+        {
+            NSUInteger tpg = MIN(ctx->fill_gaussian_random_samples_kernel_cpso.maxTotalThreadsPerThreadgroup,
+                                 (NSUInteger)split_random_count);
+            [enc setComputePipelineState:ctx->fill_gaussian_random_samples_kernel_cpso];
+            ENC_SCALAR(enc, split_random_count, 0);
+            ENC_BUF(enc, split_random_samples, 1);
+            ENC_SCALAR(enc, sample_seed, 2);
+            [enc dispatchThreads:MTLSizeMake(split_random_count, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        }
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // ---- Stage 5: Append split children ----
         {
             NSUInteger tpg = MIN(ctx->densify_append_split_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)N);
             [enc setComputePipelineState:ctx->densify_append_split_kernel_cpso];
             ENC_SCALAR(enc, N_u32, 0);
             ENC_BUF(enc, split_flag, 1);
             ENC_BUF(enc, split_prefix, 2);
-            ENC_BUF(enc, random_samples, 3);
+            ENC_BUF(enc, split_random_samples, 3);
             ENC_SCALAR(enc, log_size_fac, 4);
             ENC_BUF(enc, means_buf, 5);
             ENC_BUF(enc, scales_buf, 6);
@@ -1861,7 +1877,7 @@ int msplat_densify(
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-        // ---- Stage 5: Append duplicates ----
+        // ---- Stage 6: Append duplicates ----
         {
             NSUInteger tpg = MIN(ctx->densify_append_dup_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)N);
             [enc setComputePipelineState:ctx->densify_append_dup_kernel_cpso];
@@ -1893,7 +1909,7 @@ int msplat_densify(
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-        // ---- Stage 6: Cull classify (on post-growth population) ----
+        // ---- Stage 7: Cull classify (on post-growth population) ----
         // Dispatch worst_case threads; kernel reads N_new from prefix sums
         {
             uint32_t wc = (uint32_t)worst_case;
@@ -1916,7 +1932,7 @@ int msplat_densify(
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-        // ---- Stage 7: Prefix sum on keep_flag → keep_prefix ----
+        // ---- Stage 8: Prefix sum on keep_flag → keep_prefix ----
         // Over worst_case elements (includes padding zeros for unused slots)
         {
             uint32_t wc = (uint32_t)worst_case;
@@ -1924,7 +1940,7 @@ int msplat_densify(
             encode_block_prefix(wc, K2, keep_flag, keep_prefix);
         }
 
-        // ---- Stage 8: Compact scatter (18 buffers → scratch) ----
+        // ---- Stage 9: Compact scatter (18 buffers → scratch) ----
         // For each buffer: scatter kept elements into compact_scratch
         // Then copy back. We reuse compact_scratch at different offsets per stride.
         for (int b = 0; b < 18; b++) {

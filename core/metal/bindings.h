@@ -104,7 +104,7 @@ int msplat_densify(
     MTensor &keep_flag, MTensor &keep_prefix,
     MTensor &block_totals, MTensor &compact_scratch,
     MTensor &keep_count_readback,
-    MTensor &random_samples,
+    uint32_t sample_seed,
     int skip_dup = 0
 );
 

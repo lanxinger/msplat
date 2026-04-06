@@ -1873,6 +1873,22 @@ inline float2 gpu_randn_pair(uint seed) {
     return float2(r * cos(theta), r * sin(theta));
 }
 
+kernel void fill_gaussian_random_samples_kernel(
+    constant uint& count [[buffer(0)]],
+    device float* out [[buffer(1)]],  // [count, 3]
+    constant uint& base_seed [[buffer(2)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= count) return;
+
+    uint seed = base_seed * 0x9E3779B9u + idx * 3u;
+    float2 g01 = gpu_randn_pair(seed);
+    float2 g23 = gpu_randn_pair(seed + 0x12345678u);
+    out[idx*3]     = clamp(g01.x, -2.5f, 2.5f);
+    out[idx*3 + 1] = clamp(g01.y, -2.5f, 2.5f);
+    out[idx*3 + 2] = clamp(g23.x, -2.5f, 2.5f);
+}
+
 kernel void apply_mean_noise_kernel(
     constant int& N [[buffer(0)]],
     constant float& mean_noise_weight [[buffer(1)]],

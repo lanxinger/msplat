@@ -203,14 +203,6 @@ void afterTrainClassicOrHybrid(Model &model, int step) {
             int numPointsBefore = model.num_active;
             model.ensureCapacity(3 * model.num_active);  // worst case: every gaussian splits
 
-            // Fill random samples for splits (CPU randn, shared memory)
-            {
-                std::mt19937 rng(step);
-                std::normal_distribution<float> dist(0.0f, 1.0f);
-                float *p = model.densify_random_samples.data<float>();
-                for (int64_t i = 0; i < 2 * model.num_active * 3; i++) p[i] = dist(rng);
-            }
-
             float half_max_dim = 0.5f * static_cast<float>((std::max)(model.lastWidth, model.lastHeight));
             int check_screen = (step < model.stopScreenSizeAt) ? 1 : 0;
             bool checkHuge = step > model.refineEvery * model.resetAlphaEvery;
@@ -229,7 +221,7 @@ void afterTrainClassicOrHybrid(Model &model, int step) {
                 model.densify_keep_flag, model.densify_keep_prefix,
                 model.densify_block_totals, model.densify_compact_scratch,
                 model.densify_keep_count_readback,
-                model.densify_random_samples,
+                static_cast<uint32_t>(step),
                 0
             );
 
