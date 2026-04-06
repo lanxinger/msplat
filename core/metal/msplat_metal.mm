@@ -470,6 +470,7 @@ struct FusedTensorCache {
     MTensor gaussian_ids;
     MTensor packed_xy_opac, packed_conic, packed_rgb;
     MTensor out_img, final_Ts, final_idx;
+    MTensor out_img_readback, final_Ts_readback;
     MTensor loss_intermediates;
     MTensor densify_error_map;
     MTensor ssim_h_buf;
@@ -522,8 +523,10 @@ struct FusedTensorCache {
         }
         if (ih != img_height || iw != img_width) {
             img_height = ih; img_width = iw;
-            out_img = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
-            final_Ts = mtensor_empty(dev, {ih, iw}, DType::Float32);
+            out_img = mtensor_empty_private(dev, {ih, iw, 3}, DType::Float32);
+            final_Ts = mtensor_empty_private(dev, {ih, iw}, DType::Float32);
+            out_img_readback = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            final_Ts_readback = mtensor_empty(dev, {ih, iw}, DType::Float32);
             final_idx = mtensor_empty_private(dev, {ih, iw}, DType::Int32);
             loss_intermediates = mtensor_empty_private(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float16);
             densify_error_map = mtensor_empty_private(dev, {ih, iw}, DType::Float32);
@@ -574,6 +577,25 @@ struct FusedTensorCache {
     }
 };
 static FusedTensorCache g_tcache;
+
+static void encode_render_readback_copy(id<MTLCommandBuffer> command_buffer, bool copy_rgb, bool copy_alpha) {
+    id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+    if (copy_rgb) {
+        [blit copyFromBuffer:g_tcache.out_img.buffer()
+                sourceOffset:0
+                    toBuffer:g_tcache.out_img_readback.buffer()
+           destinationOffset:0
+                        size:g_tcache.out_img.nbytes()];
+    }
+    if (copy_alpha) {
+        [blit copyFromBuffer:g_tcache.final_Ts.buffer()
+                sourceOffset:0
+                    toBuffer:g_tcache.final_Ts_readback.buffer()
+           destinationOffset:0
+                        size:g_tcache.final_Ts.nbytes()];
+    }
+    [blit endEncoding];
+}
 
 static void maybe_warn_overflow(MetalContext* ctx, int num_points, int iter_count) {
     if (!g_tcache.overflow_flag.defined() || g_tcache.fwd_num_points <= 0) return;
@@ -1043,9 +1065,25 @@ MTensor msplat_render_edge_scores(
 // Must be called after msplat_render and before the next render.
 void msplat_get_render_alpha(float* out, int n) {
     MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    assert(command_buffer && "Failed to retrieve command buffer reference");
+    dispatch_sync(ctx->d_queue, ^(){
+        encode_render_readback_copy(command_buffer, false, true);
+    });
     ctx->syncCB();
-    const float *t = g_tcache.final_Ts.data<float>();
+    const float *t = g_tcache.final_Ts_readback.data<float>();
     for (int i = 0; i < n; i++) out[i] = 1.0f - t[i];
+}
+
+void msplat_read_last_render_rgb(float* out, int n) {
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    assert(command_buffer && "Failed to retrieve command buffer reference");
+    dispatch_sync(ctx->d_queue, ^(){
+        encode_render_readback_copy(command_buffer, true, false);
+    });
+    ctx->syncCB();
+    memcpy(out, g_tcache.out_img_readback.data_ptr(), (size_t)n * sizeof(float));
 }
 
 void msplat_pack_last_render_rgba(uint8_t* outRGBA, int width, int height, const float bg[3]) {

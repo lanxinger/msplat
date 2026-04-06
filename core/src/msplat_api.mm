@@ -21,6 +21,12 @@
 
 namespace msplat {
 
+static MTensor readLastRenderRgbCpu(int width, int height) {
+    MTensor rgbCpu({height, width, 3}, DType::Float32);
+    msplat_read_last_render_rgb(rgbCpu.data<float>(), width * height * 3);
+    return rgbCpu;
+}
+
 static Strategy strategyFromInt(int value) {
     switch (value) {
         case 0: return Strategy::Classic;
@@ -230,8 +236,7 @@ EvalMetrics Trainer::evaluate() {
     for (int i = 0; i < n; i++) {
         Camera& cam = testCams[i];
         MTensor rgb = impl->model->render(cam, impl->config.iterations);
-        msplat_gpu_sync();
-        MTensor rgbCpu = rgb.cpu();
+        MTensor rgbCpu = readLastRenderRgbCpu((int)rgb.size(1), (int)rgb.size(0));
         int dsf = impl->model->getDownscaleFactor(impl->config.iterations);
         MTensor gtCpu = cam.getGPUImage(dsf).cpu();
         MTensor maskCpu;
@@ -262,8 +267,7 @@ PixelBuffer Trainer::render(int cameraIndex, bool useTest) {
 
     Camera& cam = cams[cameraIndex];
     MTensor rgb = impl->model->render(cam, impl->currentStep);
-    msplat_gpu_sync();
-    MTensor rgbCpu = rgb.cpu();
+    MTensor rgbCpu = readLastRenderRgbCpu((int)rgb.size(1), (int)rgb.size(0));
 
     int h = (int)rgbCpu.size(0);
     int w = (int)rgbCpu.size(1);
@@ -286,8 +290,7 @@ PixelBuffer Trainer::renderFromPose(const float camToWorld[16], int refCameraInd
     cam.cachedProjViewMat = MTensor();
 
     MTensor rgb = impl->model->render(cam, impl->currentStep);
-    msplat_gpu_sync();
-    MTensor rgbCpu = rgb.cpu();
+    MTensor rgbCpu = readLastRenderRgbCpu((int)rgb.size(1), (int)rgb.size(0));
 
     int h = (int)rgbCpu.size(0);
     int w = (int)rgbCpu.size(1);

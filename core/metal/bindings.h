@@ -111,6 +111,10 @@ int msplat_densify(
 // Must be called after msplat_render/msplat_gpu_sync and before the next render.
 void msplat_get_render_alpha(float* out, int n);
 
+// Read the most recent RGB render into caller-provided float storage.
+// Encodes a blit into a shared readback buffer and waits for completion.
+void msplat_read_last_render_rgb(float* out, int n);
+
 // Encode conversion of the most recent render target to premultiplied RGBA8.
 // Writes directly into caller-provided shared memory. Call msplat_gpu_sync()
 // after encoding to wait for completion.
