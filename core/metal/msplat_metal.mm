@@ -169,6 +169,11 @@ struct MetalContext {
     id<MTLComputePipelineState> hybrid_refine_kernel_cpso;
     id<MTLComputePipelineState> accumulate_refine_max_kernel_cpso;
     id<MTLComputePipelineState> long_axis_split_kernel_cpso;
+
+    // Retained for deferred function-constant specialization
+    id<MTLLibrary> metal_library;
+    uint specialized_degrees_to_use = UINT_MAX;  // sentinel: not yet specialized
+    bool specialized_has_mask = false;
 };
 
 // Explicit metallib path (set by Swift/Python wrappers before first use)
@@ -177,6 +182,30 @@ static char* g_metallib_path = NULL;
 extern "C" void msplat_set_metallib_path(const char* path) {
     free(g_metallib_path);
     g_metallib_path = path ? strdup(path) : NULL;
+}
+
+// Build a specialized PSO for a kernel that uses [[function_constant]] attributes.
+static id<MTLComputePipelineState> load_specialized(
+    id<MTLDevice> device, id<MTLLibrary> library,
+    NSString* name, MTLFunctionConstantValues* fcv
+) {
+    NSError *error = nil;
+    id<MTLFunction> fn = [library newFunctionWithName:name
+                                       constantValues:fcv
+                                                error:&error];
+    if (!fn) {
+        fprintf(stderr, "msplat: kernel not found for specialization: %s (%s)\n",
+                [name UTF8String], error ? [[error description] UTF8String] : "");
+        return nil;
+    }
+    id<MTLComputePipelineState> pso =
+        [device newComputePipelineStateWithFunction:fn error:&error];
+    [fn release];
+    if (error) {
+        fprintf(stderr, "msplat: failed to create specialized pipeline for %s: %s\n",
+                [name UTF8String], [[error description] UTF8String]);
+    }
+    return pso;
 }
 
 MetalContext* init_msplat_metal_context() {
@@ -240,8 +269,21 @@ MetalContext* init_msplat_metal_context() {
         return pso;
     };
 
-    // Forward pipeline
-    ctx->project_and_sh_forward_kernel_cpso       = load(@"project_and_sh_forward_kernel");
+    // Default function constant values for initial PSO creation.
+    // Kernels that reference [[function_constant]] cannot use plain newFunctionWithName:
+    // — Metal requires newFunctionWithName:constantValues: for these.
+    MTLFunctionConstantValues *init_fcv = [MTLFunctionConstantValues new];
+    uint init_dtu = 0;
+    bool init_hm  = false;
+    [init_fcv setConstantValue:&init_dtu type:MTLDataTypeUInt atIndex:0];
+    [init_fcv setConstantValue:&init_hm  type:MTLDataTypeBool atIndex:1];
+
+    auto load_fc = [&](NSString* name) -> id<MTLComputePipelineState> {
+        return load_specialized(ctx->device, metal_library, name, init_fcv);
+    };
+
+    // Forward pipeline (function-constant kernels use load_fc)
+    ctx->project_and_sh_forward_kernel_cpso       = load_fc(@"project_and_sh_forward_kernel");
     ctx->nd_rasterize_forward_kernel_cpso         = load(@"nd_rasterize_forward_kernel");
     ctx->rasterize_edge_scores_kernel_cpso        = load(@"rasterize_edge_scores_kernel");
     // Tile-local sorting
@@ -260,11 +302,12 @@ MetalContext* init_msplat_metal_context() {
     // Separable SSIM loss
     ctx->ssim_h_fwd_kernel_cpso                   = load(@"ssim_h_fwd_kernel");
     ctx->ssim_v_fwd_kernel_cpso                   = load(@"ssim_v_fwd_kernel");
-    ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso       = load(@"ssim_fused_v_fwd_h_bwd_kernel");
-    ctx->ssim_v_bwd_kernel_cpso                   = load(@"ssim_v_bwd_kernel");
+    ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso       = load_fc(@"ssim_fused_v_fwd_h_bwd_kernel");
+    ctx->ssim_v_bwd_kernel_cpso                   = load_fc(@"ssim_v_bwd_kernel");
     // Backward pipeline
-    ctx->project_and_sh_backward_kernel_cpso      = load(@"project_and_sh_backward_kernel");
+    ctx->project_and_sh_backward_kernel_cpso      = load_fc(@"project_and_sh_backward_kernel");
     ctx->fused_adam_kernel_cpso                    = load(@"fused_adam_kernel");
+    [init_fcv release];
     ctx->accumulate_grad_stats_kernel_cpso        = load(@"accumulate_grad_stats_kernel");
     ctx->apply_mean_noise_kernel_cpso             = load(@"apply_mean_noise_kernel");
     // GPU densification
@@ -278,7 +321,8 @@ MetalContext* init_msplat_metal_context() {
     ctx->accumulate_refine_max_kernel_cpso        = load(@"accumulate_refine_max_kernel");
     ctx->long_axis_split_kernel_cpso              = load(@"long_axis_split_kernel");
 
-    [metal_library release];
+    // Retain library for deferred function-constant specialization
+    ctx->metal_library = metal_library;  // ownership transferred
 
     // Initialize counter sampling if PROFILE_STAGES is set
     ctx->counterSampleBuffer = nil;
@@ -301,7 +345,49 @@ MetalContext* get_global_context() {
     return ctx;
 }
 
+void msplat_specialize_pipelines(unsigned degrees_to_use, bool has_mask) {
+    MetalContext* ctx = get_global_context();
 
+    if (ctx->specialized_degrees_to_use == degrees_to_use &&
+        ctx->specialized_has_mask == has_mask) {
+        return;  // already specialized for this config
+    }
+
+    MTLFunctionConstantValues *fcv = [MTLFunctionConstantValues new];
+    uint fc_dtu = degrees_to_use;
+    bool fc_hm  = has_mask;
+    [fcv setConstantValue:&fc_dtu type:MTLDataTypeUInt atIndex:0];
+    [fcv setConstantValue:&fc_hm  type:MTLDataTypeBool atIndex:1];
+
+    // Re-create only the PSOs whose kernels reference function constants.
+    auto old_fwd = ctx->project_and_sh_forward_kernel_cpso;
+    ctx->project_and_sh_forward_kernel_cpso =
+        load_specialized(ctx->device, ctx->metal_library, @"project_and_sh_forward_kernel", fcv);
+    [old_fwd release];
+
+    auto old_bwd = ctx->project_and_sh_backward_kernel_cpso;
+    ctx->project_and_sh_backward_kernel_cpso =
+        load_specialized(ctx->device, ctx->metal_library, @"project_and_sh_backward_kernel", fcv);
+    [old_bwd release];
+
+    auto old_ssim_fused = ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso;
+    ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso =
+        load_specialized(ctx->device, ctx->metal_library, @"ssim_fused_v_fwd_h_bwd_kernel", fcv);
+    [old_ssim_fused release];
+
+    auto old_ssim_vbwd = ctx->ssim_v_bwd_kernel_cpso;
+    ctx->ssim_v_bwd_kernel_cpso =
+        load_specialized(ctx->device, ctx->metal_library, @"ssim_v_bwd_kernel", fcv);
+    [old_ssim_vbwd release];
+
+    [fcv release];
+
+    ctx->specialized_degrees_to_use = degrees_to_use;
+    ctx->specialized_has_mask = has_mask;
+
+    fprintf(stderr, "msplat: specialized pipelines (sh_degree=%u, has_mask=%d)\n",
+            degrees_to_use, has_mask);
+}
 
 #define ENC_SCALAR(encoder, x, i) [encoder setBytes:&x length:sizeof(x) atIndex:i]
 #define ENC_ARRAY(encoder, x, i) [encoder setBytes:x length:sizeof(x) atIndex:i]
@@ -426,10 +512,10 @@ struct FusedTensorCache {
             img_height = ih; img_width = iw;
             out_img = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
             final_Ts = mtensor_empty(dev, {ih, iw}, DType::Float32);
-            final_idx = mtensor_empty(dev, {ih, iw}, DType::Int32);
-            loss_intermediates = mtensor_empty_private(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
+            final_idx = mtensor_empty_private(dev, {ih, iw}, DType::Int32);
+            loss_intermediates = mtensor_empty_private(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float16);
             densify_error_map = mtensor_empty_private(dev, {ih, iw}, DType::Float32);
-            ssim_h_buf = mtensor_empty_private(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
+            ssim_h_buf = mtensor_empty_private(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float16);
             v_rendered = mtensor_empty_private(dev, {ih, iw, 3}, DType::Float32);
             v_alpha_img = mtensor_empty_private(dev, {ih, iw}, DType::Float32);
         }
@@ -791,6 +877,7 @@ MTensor msplat_render(
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background
 ) {
+    msplat_specialize_pipelines(degrees_to_use, false);
     MTensor dummyGt, dummyWindow;
     forward_pipeline(num_points, means3d, scales, glob_scale,
         quats, viewmat, projmat, fx, fy, cx, cy,
@@ -810,6 +897,7 @@ MTensor msplat_render_edge_scores(
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &edge_map
 ) {
+    msplat_specialize_pipelines(degrees_to_use, false);
     MetalContext* ctx = get_global_context();
     int tile_bounds_x = std::get<0>(tile_bounds);
     int tile_bounds_y = std::get<1>(tile_bounds);
@@ -969,6 +1057,11 @@ MTensor msplat_train_step(
     MTensor *mask
 ) {
     MetalContext* ctx = get_global_context();
+
+    // Specialize pipelines for current SH degree / mask config (no-ops if unchanged)
+    bool has_mask_flag = mask && mask->defined();
+    msplat_specialize_pipelines(degrees_to_use, has_mask_flag);
+
     int tile_bounds_x = std::get<0>(tile_bounds);
     int tile_bounds_y = std::get<1>(tile_bounds);
     int num_tiles = tile_bounds_x * tile_bounds_y;

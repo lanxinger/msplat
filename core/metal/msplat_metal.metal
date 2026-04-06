@@ -38,6 +38,12 @@ constant float SH_C4[] = {
     -1.7701307697799304f,
     0.6258357354491761f};
 
+// Function constants for compile-time pipeline specialization.
+// Set via MTLFunctionConstantValues at PSO creation; the Metal compiler
+// eliminates dead branches for the chosen values.
+constant uint fc_degrees_to_use [[function_constant(0)]];
+constant bool fc_has_mask       [[function_constant(1)]];
+
 inline uint num_sh_bases(const uint degree) {
     if (degree == 0)
         return 1;
@@ -1979,7 +1985,7 @@ kernel void project_and_sh_forward_kernel(
     uint dc_idx = num_channels * idx;
     uint rest_idx = (num_bases - 1) * num_channels * idx;
     uint idx_col = num_channels * idx;
-    sh_coeffs_to_color(degrees_to_use, viewdir, &(features_dc[dc_idx]), &(features_rest[rest_idx]), &(colors[idx_col]));
+    sh_coeffs_to_color(fc_degrees_to_use, viewdir, &(features_dc[dc_idx]), &(features_rest[rest_idx]), &(colors[idx_col]));
 }
 
 // Adam update helper — applies one Adam step to a single element.
@@ -2124,7 +2130,7 @@ kernel void project_and_sh_backward_kernel(
                            g, adam_hp.dc_step_size, adam_hp.beta1, adam_hp.beta2, adam_hp.dc_bc2_sqrt, adam_hp.eps);
     }
 
-    if (degrees_to_use < 1) return;
+    if (fc_degrees_to_use < 1) return;
 
     float x = viewdir.x, y = viewdir.y, z = viewdir.z;
     float xx = x*x, xy = x*y, xz = x*z, yy = y*y, yz = y*z, zz = z*z;
@@ -2140,7 +2146,7 @@ kernel void project_and_sh_backward_kernel(
         }
     }
 
-    if (degrees_to_use < 2) return;
+    if (fc_degrees_to_use < 2) return;
 
     // SH degree 2 (5 bases)
     float sh2[5] = {
@@ -2159,7 +2165,7 @@ kernel void project_and_sh_backward_kernel(
         }
     }
 
-    if (degrees_to_use < 3) return;
+    if (fc_degrees_to_use < 3) return;
 
     // SH degree 3 (7 bases)
     float sh3[7] = {
@@ -3295,7 +3301,7 @@ kernel void ssim_h_fwd_kernel(
     constant float* rendered,       // (H, W, 3) HWC
     constant float* gt,             // (H, W, 3) HWC
     constant uint2& img_size,       // (W, H)
-    device float* ssim_h_buf,       // (H, W, 15)
+    device half* ssim_h_buf,        // (H, W, 15) — half precision intermediate
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -3346,11 +3352,11 @@ kernel void ssim_h_fwd_kernel(
                 cross_xy += w * gv * rv;
             }
             uint out = (py * W + px) * 15 + c * 5;
-            ssim_h_buf[out + 0] = mu_x;
-            ssim_h_buf[out + 1] = mu_y;
-            ssim_h_buf[out + 2] = sq_x;
-            ssim_h_buf[out + 3] = sq_y;
-            ssim_h_buf[out + 4] = cross_xy;
+            ssim_h_buf[out + 0] = half(mu_x);
+            ssim_h_buf[out + 1] = half(mu_y);
+            ssim_h_buf[out + 2] = half(sq_x);
+            ssim_h_buf[out + 3] = half(sq_y);
+            ssim_h_buf[out + 4] = half(cross_xy);
         }
     }
 }
@@ -3361,10 +3367,10 @@ kernel void ssim_h_fwd_kernel(
 kernel void ssim_v_fwd_kernel(
     constant float* rendered,       // (H, W, 3) for L1
     constant float* gt,             // (H, W, 3) for L1
-    constant float* ssim_h_buf,     // (H, W, 15)
+    constant half* ssim_h_buf,      // (H, W, 15) — half precision intermediate
     constant uint2& img_size,       // (W, H)
     constant float& ssim_weight,
-    device float* intermediates,    // (H, W, 15)
+    device half* intermediates,     // (H, W, 15) — half precision intermediate
     device atomic_float* loss_sum,
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
@@ -3421,11 +3427,11 @@ kernel void ssim_v_fwd_kernel(
 
             // Store intermediates (same format as fused_loss_forward_kernel)
             uint iidx = (py * W + px) * 15 + c * 5;
-            intermediates[iidx + 0] = mu_x;
-            intermediates[iidx + 1] = mu_y;
-            intermediates[iidx + 2] = sigma_x_sq;
-            intermediates[iidx + 3] = sigma_y_sq;
-            intermediates[iidx + 4] = sigma_xy;
+            intermediates[iidx + 0] = half(mu_x);
+            intermediates[iidx + 1] = half(mu_y);
+            intermediates[iidx + 2] = half(sigma_x_sq);
+            intermediates[iidx + 3] = half(sigma_y_sq);
+            intermediates[iidx + 4] = half(sigma_xy);
 
             // SSIM for this channel
             float A  = 2.0f * mu_x * mu_y + SSIM_C1;
@@ -3466,9 +3472,9 @@ kernel void ssim_v_fwd_kernel(
 // Eliminates loss_intermediates round-trip (130 MB/iter bandwidth saved).
 kernel void ssim_fused_v_fwd_h_bwd_kernel(
     constant float* rendered, constant float* gt,
-    constant float* ssim_h_buf, constant uint2& img_size,
+    constant half* ssim_h_buf, constant uint2& img_size,
     constant float& ssim_weight, constant float& inv_n,
-    device float* deriv_h_buf, device atomic_float* loss_sum,
+    device half* deriv_h_buf, device atomic_float* loss_sum,
     constant float* mask [[buffer(8)]],
     constant int& has_mask [[buffer(9)]],
     constant float* final_Ts [[buffer(10)]],
@@ -3525,7 +3531,7 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
             float der3 = dsxy;
             // Pre-mask derivative fields so masked-out pixels don't bleed
             // gradient through the backward convolution window (LichtFeld-style).
-            if (has_mask) {
+            if (fc_has_mask) {
                 int gx_d = base_gx + (int)dx;
                 int gy_d = base_gy + (int)(dy + SSIM_HALF_WIN);
                 float mw = (gx_d >= 0 && gx_d < (int)W && gy_d >= 0 && gy_d < (int)H)
@@ -3552,13 +3558,13 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
                 h1 += w*tg_f1[lid.y][lid.x+dx]; h2 += w*tg_f2[lid.y][lid.x+dx]; h3 += w*tg_f3[lid.y][lid.x+dx];
             }
             uint out = (py*W+px)*15 + c*5;
-            deriv_h_buf[out+0]=h1; deriv_h_buf[out+1]=h2; deriv_h_buf[out+2]=h3;
+            deriv_h_buf[out+0]=half(h1); deriv_h_buf[out+1]=half(h2); deriv_h_buf[out+2]=half(h3);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     float pixel_loss = (px < W && py < H) ? ssim_weight*(1.0f-ssim_sum/3.0f) + (1.0f-ssim_weight)*l1_sum/3.0f : 0.0f;
-    if (has_mask && px < W && py < H) {
+    if (fc_has_mask && px < W && py < H) {
         float m = mask[py * W + px];
         float bg_weight = (1.0f - m) * (1.0f - m);
         float alpha = 1.0f - final_Ts[py * W + px];
@@ -3662,7 +3668,7 @@ kernel void ssim_h_bwd_kernel(
 kernel void ssim_v_bwd_kernel(
     constant float* rendered,       // (H, W, 3)
     constant float* gt,             // (H, W, 3)
-    constant float* ssim_h_buf,     // (H, W, 15)
+    constant half* ssim_h_buf,      // (H, W, 15) — half precision derivative fields
     constant uint2& img_size,       // (W, H)
     constant float& ssim_weight,
     constant float& inv_n,          // 1.0 / (H * W * 3)
@@ -3730,7 +3736,7 @@ kernel void ssim_v_bwd_kernel(
             // fields (applied before backward convolution). L1 gradient is
             // per-pixel and must be masked separately.
             float grad = inv_n * (-ssim_weight * v_ssim);
-            if (has_mask) {
+            if (fc_has_mask) {
                 float m = mask[py * W + px];
                 grad += inv_n * (1.0f - ssim_weight) * v_l1 * m;
                 if (c == 0) {

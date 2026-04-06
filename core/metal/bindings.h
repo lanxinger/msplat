@@ -19,6 +19,12 @@ MTensor gpu_zeros(std::vector<int64_t> shape, DType dtype);
 MTensor gpu_empty(std::vector<int64_t> shape, DType dtype);
 MTensor gpu_empty_private(std::vector<int64_t> shape, DType dtype);
 
+// Build specialized compute PSOs for the given training config.
+// Replaces generic pipelines with function-constant-specialized variants,
+// eliminating dead branches for SH degree and mask mode.
+// Safe to call multiple times — no-ops if config unchanged.
+void msplat_specialize_pipelines(unsigned degrees_to_use, bool has_mask);
+
 // Commit current command buffer (non-blocking)
 void msplat_commit();
 
