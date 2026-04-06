@@ -2039,7 +2039,7 @@ void msplat_apply_mean_noise(
 
 void msplat_hybrid_refine(
     int num_active, int budget, int fr_stride,
-    MTensor &donor_indices, MTensor &random_samples,
+    MTensor &donor_indices, uint32_t sample_seed,
     MTensor &means_buf, MTensor &scales_buf, MTensor &quats_buf,
     MTensor &featuresDc_buf, MTensor &featuresRest_buf, MTensor &opacities_buf,
     MTensor adam_exp_avg_buf[], MTensor adam_exp_avg_sq_buf[]
@@ -2052,11 +2052,20 @@ void msplat_hybrid_refine(
 
     uint32_t na = (uint32_t)num_active;
     uint32_t bu = (uint32_t)budget;
+    MTensor random_samples = gpu_empty_private({(int64_t)budget, 3}, DType::Float32);
     int fr_stride_val = fr_stride;
 
     dispatch_sync(ctx->d_queue, ^(){
         id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
         assert(enc && "Failed to create compute command encoder");
+
+        NSUInteger rng_tpg = MIN(ctx->fill_gaussian_random_samples_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)budget);
+        [enc setComputePipelineState:ctx->fill_gaussian_random_samples_kernel_cpso];
+        ENC_SCALAR(enc, bu, 0);
+        ENC_BUF(enc, random_samples, 1);
+        ENC_SCALAR(enc, sample_seed, 2);
+        [enc dispatchThreads:MTLSizeMake(budget, 1, 1) threadsPerThreadgroup:MTLSizeMake(rng_tpg, 1, 1)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
         NSUInteger tpg = MIN(ctx->hybrid_refine_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)budget);
         [enc setComputePipelineState:ctx->hybrid_refine_kernel_cpso];

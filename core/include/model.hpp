@@ -90,7 +90,6 @@ struct Model{
   MTensor densify_keep_count_readback;
   MTensor densify_block_totals;
   MTensor densify_compact_scratch;
-  MTensor densify_random_samples;
 
   MTensor radii;
   int lastHeight;

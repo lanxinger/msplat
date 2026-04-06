@@ -123,7 +123,7 @@ void msplat_pack_last_render_rgba(uint8_t* outRGBA, int width, int height, const
 
 void msplat_hybrid_refine(
     int num_active, int budget, int fr_stride,
-    MTensor &donor_indices, MTensor &random_samples,
+    MTensor &donor_indices, uint32_t sample_seed,
     MTensor &means_buf, MTensor &scales_buf, MTensor &quats_buf,
     MTensor &featuresDc_buf, MTensor &featuresRest_buf, MTensor &opacities_buf,
     MTensor adam_exp_avg_buf[], MTensor adam_exp_avg_sq_buf[]

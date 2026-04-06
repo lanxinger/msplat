@@ -368,7 +368,6 @@ void afterTrainClassicOrHybrid(Model &model, int step) {
                 op = model.opacities_buf.data<float>();
 
                 std::vector<int32_t> donorIdx(budget);
-                std::vector<float> rndBuf(budget * 3);
                 std::vector<uint8_t> chosen(model.num_active, 0);
                 int selected = 0;
 
@@ -381,16 +380,12 @@ void afterTrainClassicOrHybrid(Model &model, int step) {
 
                     std::mt19937 rng(seed);
                     std::uniform_real_distribution<double> uni(0.0, 1.0);
-                    std::normal_distribution<float> randn(0.0f, 1.0f);
 
                     for (int d = 0; d < count; ++d) {
                         running = sampler.total();
                         if (running <= 0.0) break;
                         int c = sampler.draw(uni(rng) * running);
                         donorIdx[selected] = c;
-                        rndBuf[selected*3]   = randn(rng);
-                        rndBuf[selected*3+1] = randn(rng);
-                        rndBuf[selected*3+2] = randn(rng);
                         chosen[c] = 1;
                         selected++;
                     }
@@ -418,10 +413,9 @@ void afterTrainClassicOrHybrid(Model &model, int step) {
                 if (selected > 0) {
                     MTensor donorBuf = gpu_empty({(int64_t)selected}, DType::Int32);
                     memcpy(donorBuf.data_ptr(), donorIdx.data(), selected * sizeof(int32_t));
-                    memcpy(model.densify_random_samples.data_ptr(), rndBuf.data(), selected * 3 * sizeof(float));
                     msplat_hybrid_refine(
                         model.num_active, selected, fr_stride,
-                        donorBuf, model.densify_random_samples,
+                        donorBuf, static_cast<uint32_t>(step ^ 0xC001D00Du),
                         model.means_buf, model.scales_buf, model.quats_buf,
                         model.featuresDc_buf, model.featuresRest_buf, model.opacities_buf,
                         model.adam_exp_avg_buf, model.adam_exp_avg_sq_buf
@@ -1097,7 +1091,6 @@ void Model::setupOptimizers(){
     int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
     densify_compact_scratch = gpu_empty_private({(int64_t)buf_capacity * fr_stride}, DType::Float32);
     densify_keep_count_readback = gpu_empty({1}, DType::Int32);
-    densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
     refineWeightMax = gpu_zeros({buf_capacity}, DType::Float32);
     errorScoreMax = gpu_zeros({buf_capacity}, DType::Float32);
     igsInitialPoints = num_active;
@@ -1118,7 +1111,7 @@ void Model::releaseOptimizers(){
     densify_split_prefix.reset(); densify_dup_prefix.reset();
     densify_keep_flag.reset(); densify_keep_prefix.reset();
     densify_keep_count_readback.reset();
-    densify_block_totals.reset(); densify_compact_scratch.reset(); densify_random_samples.reset();
+    densify_block_totals.reset(); densify_compact_scratch.reset();
     refineWeightMax.reset();
     errorScoreMax.reset();
 }
@@ -1186,7 +1179,6 @@ void Model::ensureCapacity(int needed){
     int64_t fr_stride = featuresRest_buf.stride0();
     densify_compact_scratch = gpu_empty_private({(int64_t)new_cap * fr_stride}, DType::Float32);
     densify_keep_count_readback = gpu_empty({1}, DType::Int32);
-    densify_random_samples = gpu_zeros({new_cap, 3}, DType::Float32);
     {
         MTensor new_refine = gpu_zeros({new_cap}, DType::Float32);
         if (refineWeightMax.defined())
@@ -1633,7 +1625,6 @@ int Model::loadCheckpoint(const std::string &filename) {
     int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
     densify_compact_scratch = gpu_empty_private({(int64_t)buf_capacity * fr_stride}, DType::Float32);
     densify_keep_count_readback = gpu_empty({1}, DType::Int32);
-    densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
     refineWeightMax = gpu_zeros({buf_capacity}, DType::Float32);
     errorScoreMax = gpu_zeros({buf_capacity}, DType::Float32);
     if (strategy != Strategy::IGSPlus || igsInitialPoints <= 0) igsInitialPoints = num_active;
