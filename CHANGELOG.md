@@ -1,6 +1,6 @@
 # Changelog
 
-## v1.2 (pending) — Training strategies, mask-aware training, iOS support
+## v1.2 (pending) — Training strategies, mip-splatting, mask-aware training, iOS support
 
 ### Training strategies
 
