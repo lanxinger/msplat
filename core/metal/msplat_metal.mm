@@ -484,7 +484,7 @@ struct FusedTensorCache {
     MTensor block_totals;
 
     // Intersection overflow detection
-    MTensor overflow_flag;
+    MTensor overflow_flag, overflow_flag_readback;
     int64_t capacity_multiplier = 16;
 
     // Depth-chunked rasterization buffers
@@ -545,7 +545,8 @@ struct FusedTensorCache {
             loss_sum = mtensor_empty_private(dev, {1}, DType::Float32);
         }
         if (!overflow_flag.defined()) {
-            overflow_flag = mtensor_empty(dev, {1}, DType::Int32);
+            overflow_flag = mtensor_empty_private(dev, {1}, DType::Int32);
+            overflow_flag_readback = mtensor_empty(dev, {1}, DType::Int32);
         }
     }
 
@@ -603,8 +604,19 @@ static void maybe_warn_overflow(MetalContext* ctx, int num_points, int iter_coun
     bool num_points_changed = (num_points != g_tcache.fwd_num_points && g_tcache.fwd_num_points > 0);
     if (!num_points_changed && (iter_count % 100) != 1) return;
 
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    assert(command_buffer && "Failed to retrieve command buffer reference");
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+        [blit copyFromBuffer:g_tcache.overflow_flag.buffer()
+                sourceOffset:0
+                    toBuffer:g_tcache.overflow_flag_readback.buffer()
+           destinationOffset:0
+                        size:g_tcache.overflow_flag.nbytes()];
+        [blit endEncoding];
+    });
     ctx->syncCB();
-    uint32_t flags = (uint32_t)*g_tcache.overflow_flag.data<int32_t>();
+    uint32_t flags = (uint32_t)*g_tcache.overflow_flag_readback.data<int32_t>();
     uint32_t new_flags = flags & ~g_overflow_warned_mask;
     if (new_flags == 0) return;
 
