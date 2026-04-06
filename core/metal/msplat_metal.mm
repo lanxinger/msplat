@@ -542,7 +542,7 @@ struct FusedTensorCache {
             prealloc_bins = mtensor_empty_private(dev, {(int64_t)nt * 4096}, DType::Int64);
         }
         if (!loss_sum.defined()) {
-            loss_sum = mtensor_empty(dev, {1}, DType::Float32);
+            loss_sum = mtensor_empty_private(dev, {1}, DType::Float32);
         }
         if (!overflow_flag.defined()) {
             overflow_flag = mtensor_empty(dev, {1}, DType::Int32);
