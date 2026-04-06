@@ -530,9 +530,9 @@ struct FusedTensorCache {
             out_img_readback = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
             final_Ts_readback = mtensor_empty(dev, {ih, iw}, DType::Float32);
             final_idx = mtensor_empty_private(dev, {ih, iw}, DType::Int32);
-            loss_intermediates = mtensor_empty_private(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float16);
+            loss_intermediates = mtensor_empty_private(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
             densify_error_map = mtensor_empty_private(dev, {ih, iw}, DType::Float32);
-            ssim_h_buf = mtensor_empty_private(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float16);
+            ssim_h_buf = mtensor_empty_private(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
             v_rendered = mtensor_empty_private(dev, {ih, iw, 3}, DType::Float32);
             v_alpha_img = mtensor_empty_private(dev, {ih, iw}, DType::Float32);
         }

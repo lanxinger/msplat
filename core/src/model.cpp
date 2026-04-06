@@ -943,6 +943,10 @@ Model::Model(const InputData &inputData, int numCameras,
         this->stopSplitAt = std::min(this->maxSteps, 15000);
     }
 
+    // Non-Classic strategies use a smaller Adam epsilon for finer detail convergence.
+    if (strategy != Strategy::Classic)
+        adam_eps = 1e-15f;
+
     // Set mip-splatting mode (affects pipeline specialization)
     msplat_set_mip_splatting(mipSplatting);
 
@@ -1581,6 +1585,7 @@ int Model::loadCheckpoint(const std::string &filename) {
         igsInitialPoints = numPts;
     }
     hybridRefine = strategyUsesHybridRefine(strategy);
+    adam_eps = (strategy == Strategy::Classic) ? 1e-8f : 1e-15f;
     if (strategy == Strategy::IGSPlus && maxSplats <= 0)
         throw std::runtime_error("IGSPlus checkpoint requires maxSplats > 0 in the current config");
 
@@ -1705,10 +1710,13 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight, 
     lastHeight = s.height; lastWidth = s.width;
     int numPoints = means.size(0);
 
-    // Final 10% of training: switch to pure L1 for tighter per-pixel accuracy (matches Brush aux_loss_time=0.9)
-    constexpr float auxLossTime = 0.9f;
-    if (maxSteps > 0 && step > (int)(auxLossTime * maxSteps))
-        ssimWeight = 0.0f;
+    // Final 10% of training: switch to pure L1 for tighter per-pixel accuracy (matches Brush aux_loss_time=0.9).
+    // Only for non-Classic strategies — Classic uses SSIM throughout.
+    if (strategy != Strategy::Classic) {
+        constexpr float auxLossTime = 0.9f;
+        if (maxSteps > 0 && step > (int)(auxLossTime * maxSteps))
+            ssimWeight = 0.0f;
+    }
 
     // Initialize SSIM window (once)
     if (!window2d.defined()) {
@@ -1745,10 +1753,11 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight, 
 
     // Background noise: add per-step random perturbation to prevent splats from
     // relying on a fixed background color (matches Brush background_noise_strength=0.1).
+    // Only for non-Classic strategies — Classic uses a fixed background.
     constexpr float bgNoiseStrength = 0.1f;
     float *bgPtr = backgroundColor.data<float>();
     float bgOrig[3] = {bgPtr[0], bgPtr[1], bgPtr[2]};
-    {
+    if (strategy != Strategy::Classic) {
         std::mt19937 rng(step ^ 0xB601u);
         std::uniform_real_distribution<float> dist(-bgNoiseStrength, bgNoiseStrength);
         for (int c = 0; c < 3; c++)

@@ -261,7 +261,7 @@ float3 project_cov3d_ewa(
                          t1.x*v01 + t1.y*v11 + t1.z*v12,
                          t1.x*v02 + t1.y*v12 + t1.z*v22);
 
-    return float3(dot(tv0, t0) + 0.3f, dot(tv0, t1), dot(tv1, t1) + 0.3f);
+    return float3(dot(tv0, t0), dot(tv0, t1), dot(tv1, t1));
 }
 
 // Thread-local overload: reads cov3d from registers
@@ -304,7 +304,7 @@ float3 project_cov3d_ewa(
                          t1.x*v01 + t1.y*v11 + t1.z*v12,
                          t1.x*v02 + t1.y*v12 + t1.z*v22);
 
-    return float3(dot(tv0, t0) + 0.3f, dot(tv0, t1), dot(tv1, t1) + 0.3f);
+    return float3(dot(tv0, t0), dot(tv0, t1), dot(tv1, t1));
 }
 
 inline bool compute_cov2d_bounds(
@@ -1085,12 +1085,20 @@ kernel void rasterize_backward_kernel(
     threadgroup float3 rgbs_batch[RAST_BLOCK_SIZE];
     threadgroup float comp_batch[RAST_BLOCK_SIZE];
 
-    // df/d_out for this pixel — apply derivative of forward saturate() clamp:
-    // zero gradient for channels clamped at 1.0 (overbright)
-    const float3 clamped_rgb = read_packed_float3(out_img, pix_id);
-    const float3 sat_mask = select(float3(1.f), float3(0.f), clamped_rgb >= 1.f);
-    const float3 v_out = sat_mask * read_packed_float3(v_output, pix_id);
-    const float v_alpha_pix = inside ? v_alpha_img[pix_id] : 0.f;
+    // df/d_out for this pixel.  Mask-aware training applies the saturate()
+    // derivative (zero gradient for clamped channels) and the per-pixel alpha
+    // penalty gradient.  Classic training passes the raw loss gradient through,
+    // matching the original 3DGS backward pass.
+    float3 v_out;
+    float v_alpha_pix = 0.f;
+    if (fc_has_mask) {
+        const float3 clamped_rgb = read_packed_float3(out_img, pix_id);
+        const float3 sat_mask = select(float3(1.f), float3(0.f), clamped_rgb >= 1.f);
+        v_out = sat_mask * read_packed_float3(v_output, pix_id);
+        v_alpha_pix = inside ? v_alpha_img[pix_id] : 0.f;
+    } else {
+        v_out = read_packed_float3(v_output, pix_id);
+    }
     // Hoist loop-invariant background load and T_final * bg product
     const float3 bg = {background[0], background[1], background[2]};
     const float3 T_final_bg = T_final * bg;
@@ -3192,11 +3200,18 @@ kernel void rasterize_backward_chunked_kernel(
     float T_final = final_Ts[pix_id];
     const float3 bg = {background[0], background[1], background[2]};
     const float3 T_final_bg = T_final * bg;
-    // Apply derivative of forward saturate() clamp: zero gradient for overbright channels
-    const float3 clamped_rgb = read_packed_float3(out_img, pix_id);
-    const float3 sat_mask = select(float3(1.f), float3(0.f), clamped_rgb >= 1.f);
-    const float3 v_out = sat_mask * read_packed_float3(v_output, pix_id);
-    const float v_alpha_pix = inside ? v_alpha_img[pix_id] : 0.f;
+    // Mask-aware: apply saturate() derivative + alpha penalty.
+    // Classic: pass raw gradient through (matches original 3DGS).
+    float3 v_out;
+    float v_alpha_pix = 0.f;
+    if (fc_has_mask) {
+        const float3 clamped_rgb = read_packed_float3(out_img, pix_id);
+        const float3 sat_mask = select(float3(1.f), float3(0.f), clamped_rgb >= 1.f);
+        v_out = sat_mask * read_packed_float3(v_output, pix_id);
+        v_alpha_pix = inside ? v_alpha_img[pix_id] : 0.f;
+    } else {
+        v_out = read_packed_float3(v_output, pix_id);
+    }
 
     const int bin_final = inside ? chunk_final_idx[chunk_offset] : -1;
 
@@ -3377,7 +3392,7 @@ kernel void ssim_h_fwd_kernel(
     constant float* rendered,       // (H, W, 3) HWC
     constant float* gt,             // (H, W, 3) HWC
     constant uint2& img_size,       // (W, H)
-    device half* ssim_h_buf,        // (H, W, 15) — half precision intermediate
+    device float* ssim_h_buf,       // (H, W, 15)
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -3428,11 +3443,11 @@ kernel void ssim_h_fwd_kernel(
                 cross_xy += w * gv * rv;
             }
             uint out = (py * W + px) * 15 + c * 5;
-            ssim_h_buf[out + 0] = half(mu_x);
-            ssim_h_buf[out + 1] = half(mu_y);
-            ssim_h_buf[out + 2] = half(sq_x);
-            ssim_h_buf[out + 3] = half(sq_y);
-            ssim_h_buf[out + 4] = half(cross_xy);
+            ssim_h_buf[out + 0] = mu_x;
+            ssim_h_buf[out + 1] = mu_y;
+            ssim_h_buf[out + 2] = sq_x;
+            ssim_h_buf[out + 3] = sq_y;
+            ssim_h_buf[out + 4] = cross_xy;
         }
     }
 }
@@ -3443,10 +3458,10 @@ kernel void ssim_h_fwd_kernel(
 kernel void ssim_v_fwd_kernel(
     constant float* rendered,       // (H, W, 3) for L1
     constant float* gt,             // (H, W, 3) for L1
-    constant half* ssim_h_buf,      // (H, W, 15) — half precision intermediate
+    constant float* ssim_h_buf,     // (H, W, 15)
     constant uint2& img_size,       // (W, H)
     constant float& ssim_weight,
-    device half* intermediates,     // (H, W, 15) — half precision intermediate
+    device float* intermediates,    // (H, W, 15)
     device atomic_float* loss_sum,
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
@@ -3503,11 +3518,11 @@ kernel void ssim_v_fwd_kernel(
 
             // Store intermediates (same format as fused_loss_forward_kernel)
             uint iidx = (py * W + px) * 15 + c * 5;
-            intermediates[iidx + 0] = half(mu_x);
-            intermediates[iidx + 1] = half(mu_y);
-            intermediates[iidx + 2] = half(sigma_x_sq);
-            intermediates[iidx + 3] = half(sigma_y_sq);
-            intermediates[iidx + 4] = half(sigma_xy);
+            intermediates[iidx + 0] = mu_x;
+            intermediates[iidx + 1] = mu_y;
+            intermediates[iidx + 2] = sigma_x_sq;
+            intermediates[iidx + 3] = sigma_y_sq;
+            intermediates[iidx + 4] = sigma_xy;
 
             // SSIM for this channel
             float A  = 2.0f * mu_x * mu_y + SSIM_C1;
@@ -3548,9 +3563,9 @@ kernel void ssim_v_fwd_kernel(
 // Eliminates loss_intermediates round-trip (130 MB/iter bandwidth saved).
 kernel void ssim_fused_v_fwd_h_bwd_kernel(
     constant float* rendered, constant float* gt,
-    constant half* ssim_h_buf, constant uint2& img_size,
+    constant float* ssim_h_buf, constant uint2& img_size,
     constant float& ssim_weight, constant float& inv_n,
-    device half* deriv_h_buf, device atomic_float* loss_sum,
+    device float* deriv_h_buf, device atomic_float* loss_sum,
     constant float* mask [[buffer(8)]],
     constant int& has_mask [[buffer(9)]],
     constant float* final_Ts [[buffer(10)]],
@@ -3634,7 +3649,7 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
                 h1 += w*tg_f1[lid.y][lid.x+dx]; h2 += w*tg_f2[lid.y][lid.x+dx]; h3 += w*tg_f3[lid.y][lid.x+dx];
             }
             uint out = (py*W+px)*15 + c*5;
-            deriv_h_buf[out+0]=half(h1); deriv_h_buf[out+1]=half(h2); deriv_h_buf[out+2]=half(h3);
+            deriv_h_buf[out+0]=h1; deriv_h_buf[out+1]=h2; deriv_h_buf[out+2]=h3;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -3744,7 +3759,7 @@ kernel void ssim_h_bwd_kernel(
 kernel void ssim_v_bwd_kernel(
     constant float* rendered,       // (H, W, 3)
     constant float* gt,             // (H, W, 3)
-    constant half* ssim_h_buf,      // (H, W, 15) — half precision derivative fields
+    constant float* ssim_h_buf,     // (H, W, 15) — derivative fields
     constant uint2& img_size,       // (W, H)
     constant float& ssim_weight,
     constant float& inv_n,          // 1.0 / (H * W * 3)
