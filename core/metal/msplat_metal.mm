@@ -1733,6 +1733,7 @@ int msplat_densify(
     MTensor &split_prefix, MTensor &dup_prefix,
     MTensor &keep_flag, MTensor &keep_prefix,
     MTensor &block_totals, MTensor &compact_scratch,
+    MTensor &keep_count_readback,
     MTensor &random_samples,
     int skip_dup
 ) {
@@ -1956,11 +1957,19 @@ int msplat_densify(
         }
 
         [enc endEncoding];
+
+        id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+        [blit copyFromBuffer:keep_prefix.buffer()
+                sourceOffset:(NSUInteger)(worst_case - 1) * sizeof(int32_t)
+                    toBuffer:keep_count_readback.buffer()
+           destinationOffset:0
+                        size:sizeof(int32_t)];
+        [blit endEncoding];
     });
 
-    // Single GPU→CPU sync: read new_count from keep_prefix[worst_case - 1]
+    // Single GPU→CPU sync: read back just the final prefix value.
     ctx->syncCB();
-    int new_count = keep_prefix.data<int32_t>()[worst_case - 1];
+    int new_count = keep_count_readback.data<int32_t>()[0];
     return new_count;
 }
 

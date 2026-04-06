@@ -228,6 +228,7 @@ void afterTrainClassicOrHybrid(Model &model, int step) {
                 model.densify_split_prefix, model.densify_dup_prefix,
                 model.densify_keep_flag, model.densify_keep_prefix,
                 model.densify_block_totals, model.densify_compact_scratch,
+                model.densify_keep_count_readback,
                 model.densify_random_samples,
                 0
             );
@@ -1098,11 +1099,12 @@ void Model::setupOptimizers(){
     densify_split_prefix = gpu_empty_private({buf_capacity}, DType::Int32);
     densify_dup_prefix = gpu_empty_private({buf_capacity}, DType::Int32);
     densify_keep_flag = gpu_empty_private({buf_capacity}, DType::Int32);
-    densify_keep_prefix = gpu_zeros({buf_capacity}, DType::Int32);
+    densify_keep_prefix = gpu_empty_private({buf_capacity}, DType::Int32);
     int max_blocks = (buf_capacity + 1023) / 1024;
     densify_block_totals = gpu_empty_private({max_blocks}, DType::Int32);
     int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
     densify_compact_scratch = gpu_empty_private({(int64_t)buf_capacity * fr_stride}, DType::Float32);
+    densify_keep_count_readback = gpu_empty({1}, DType::Int32);
     densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
     refineWeightMax = gpu_zeros({buf_capacity}, DType::Float32);
     errorScoreMax = gpu_zeros({buf_capacity}, DType::Float32);
@@ -1123,6 +1125,7 @@ void Model::releaseOptimizers(){
     densify_split_flag.reset(); densify_dup_flag.reset();
     densify_split_prefix.reset(); densify_dup_prefix.reset();
     densify_keep_flag.reset(); densify_keep_prefix.reset();
+    densify_keep_count_readback.reset();
     densify_block_totals.reset(); densify_compact_scratch.reset(); densify_random_samples.reset();
     refineWeightMax.reset();
     errorScoreMax.reset();
@@ -1185,11 +1188,12 @@ void Model::ensureCapacity(int needed){
     densify_split_prefix = gpu_empty_private({new_cap}, DType::Int32);
     densify_dup_prefix = gpu_empty_private({new_cap}, DType::Int32);
     densify_keep_flag = gpu_empty_private({new_cap}, DType::Int32);
-    densify_keep_prefix = gpu_zeros({new_cap}, DType::Int32);
+    densify_keep_prefix = gpu_empty_private({new_cap}, DType::Int32);
     int max_blocks = (new_cap + 1023) / 1024;
     densify_block_totals = gpu_empty_private({max_blocks}, DType::Int32);
     int64_t fr_stride = featuresRest_buf.stride0();
     densify_compact_scratch = gpu_empty_private({(int64_t)new_cap * fr_stride}, DType::Float32);
+    densify_keep_count_readback = gpu_empty({1}, DType::Int32);
     densify_random_samples = gpu_zeros({new_cap, 3}, DType::Float32);
     {
         MTensor new_refine = gpu_zeros({new_cap}, DType::Float32);
@@ -1631,11 +1635,12 @@ int Model::loadCheckpoint(const std::string &filename) {
     densify_split_prefix = gpu_empty_private({buf_capacity}, DType::Int32);
     densify_dup_prefix = gpu_empty_private({buf_capacity}, DType::Int32);
     densify_keep_flag = gpu_empty_private({buf_capacity}, DType::Int32);
-    densify_keep_prefix = gpu_zeros({buf_capacity}, DType::Int32);
+    densify_keep_prefix = gpu_empty_private({buf_capacity}, DType::Int32);
     int max_blocks = (buf_capacity + 1023) / 1024;
     densify_block_totals = gpu_empty_private({max_blocks}, DType::Int32);
     int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
     densify_compact_scratch = gpu_empty_private({(int64_t)buf_capacity * fr_stride}, DType::Float32);
+    densify_keep_count_readback = gpu_empty({1}, DType::Int32);
     densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
     refineWeightMax = gpu_zeros({buf_capacity}, DType::Float32);
     errorScoreMax = gpu_zeros({buf_capacity}, DType::Float32);

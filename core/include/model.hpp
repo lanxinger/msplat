@@ -87,6 +87,7 @@ struct Model{
   MTensor densify_split_flag, densify_dup_flag;
   MTensor densify_split_prefix, densify_dup_prefix;
   MTensor densify_keep_flag, densify_keep_prefix;
+  MTensor densify_keep_count_readback;
   MTensor densify_block_totals;
   MTensor densify_compact_scratch;
   MTensor densify_random_samples;
