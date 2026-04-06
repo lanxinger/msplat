@@ -92,9 +92,10 @@ public:
     {
         data = inputDataFromX(path);
 
-        // Load images (parallel)
+        // Metadata-only init: compute intrinsics/undistortion geometry without pixel decode.
+        // Pixels are loaded lazily on first GPU access per training step.
         for (auto &cam : data.cameras) {
-            cam.loadImage(downscale_factor);
+            cam.loadMetadataOnly(downscale_factor);
         }
 
         if (eval_mode) {
@@ -180,6 +181,7 @@ public:
         int ds = model->getDownscaleFactor(current_step);
         MTensor &gt = cam.getGPUImage(ds);
         MTensor *maskPtr = cam.hasMask() ? &cam.getGPUMask(ds) : nullptr;
+        cam.releaseCPUData();  // free reloaded pixels after GPU upload
 
         auto t0 = std::chrono::high_resolution_clock::now();
 

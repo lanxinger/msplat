@@ -17,6 +17,8 @@ Points readPly(const std::string &path);
 Points readColmapPoints(const std::string &path);
 
 // Image I/O
+bool imageHasAlphaChannel(const std::string &path);  // metadata-only, no pixel decode
+bool imageFileDimensions(const std::string &path, int &width, int &height);  // metadata-only
 Image imreadRGB(const std::string &path, int maxDim = 0);  // maxDim>0: subsample decode
 Mask imreadMask(const std::string &path, int maxDim = 0);  // maxDim>0: subsample decode
 Mask imreadAlphaMask(const std::string &path, int maxDim = 0);  // empty if source has no useful alpha
@@ -25,6 +27,16 @@ Mask resizeAreaMask(const Mask &src, int dstW, int dstH);  // box-filter downsca
 void imwriteRGB(const std::string &path, const Image &img);  // save as PNG
 
 // Undistortion (Brown-Conrady model, alpha=0 crop)
+struct UndistortROI {
+    float fx, fy, cx, cy;  // updated intrinsics after crop
+    int width, height;      // cropped dimensions
+    int roiX, roiY;         // crop origin in undistorted full-size image
+};
+// Compute undistortion ROI + new intrinsics without touching pixel data.
+UndistortROI computeUndistortROI(int srcW, int srcH,
+    float fx, float fy, float cx, float cy,
+    float k1, float k2, float p1, float p2, float k3);
+
 struct UndistortResult {
     Image image;
     float fx, fy, cx, cy;  // updated intrinsics after crop

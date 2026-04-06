@@ -45,14 +45,29 @@ struct Camera {
     float cachedCamPos[3] = {};
     float cachedFovX = 0, cachedFovY = 0;
 
+    // Lazy reload: saved during loadImage so pixels can be re-decoded from disk
+    // after releaseCPUData() frees the in-memory copies.
+    std::string maskPath_;
+    bool maskFromAlpha_ = false;
+    struct ReloadState {
+        bool hadDistortion = false;
+        float k1 = 0, k2 = 0, k3 = 0, p1 = 0, p2 = 0;
+        float fx = 0, fy = 0, cx = 0, cy = 0;
+        int width = 0, height = 0;
+        int roiX = 0, roiY = 0, roiW = 0, roiH = 0;
+    } reload_;
+
     void loadImage(float downscaleFactor, const std::string &maskDir = "");
+    void loadMetadataOnly(float downscaleFactor, const std::string &maskDir = "");
+    void reloadImage();
+    void reloadMask();
     Image getImage(int downscaleFactor);
     Mask getMask(int downscaleFactor);
     MTensor& getGPUImage(int downscaleFactor);
     MTensor& getGPUMask(int downscaleFactor);
     MTensor& getGPUEdgeMap(int downscaleFactor);
     void releaseCPUData();  // free CPU images/masks after GPU upload
-    bool hasMask() const { return !mask.empty() || !mtensorMaskCache.empty(); }
+    bool hasMask() const { return !mask.empty() || !mtensorMaskCache.empty() || !maskPath_.empty() || maskFromAlpha_; }
     bool hasDistortion() const { return k1 != 0 || k2 != 0 || k3 != 0 || p1 != 0 || p2 != 0; }
 };
 

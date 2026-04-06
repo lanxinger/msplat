@@ -193,8 +193,10 @@ void Camera::loadImage(float downscaleFactor, const std::string &maskDir) {
     Mask rawMask;
     if (!maskPath.empty()) {
         rawMask = imreadMask(maskPath, thumbMaxDim);
+        if (!rawMask.empty()) maskPath_ = maskPath;
     } else {
         rawMask = imreadAlphaMask(filePath, thumbMaxDim);
+        if (!rawMask.empty()) maskFromAlpha_ = true;
     }
 
     // Ensure mask matches image dimensions (resize if mismatched)
@@ -226,10 +228,21 @@ void Camera::loadImage(float downscaleFactor, const std::string &maskDir) {
         width = newW; height = newH;
     }
 
-    // Undistort if needed
+    // Undistort if needed — save state for lazy reload
     if (hasDistortion()) {
+        reload_.hadDistortion = true;
+        reload_.k1 = k1; reload_.k2 = k2; reload_.k3 = k3;
+        reload_.p1 = p1; reload_.p2 = p2;
+        reload_.fx = fx; reload_.fy = fy;
+        reload_.cx = cx; reload_.cy = cy;
+        reload_.width = width; reload_.height = height;
+
         auto result = undistortImage(raw, fx, fy, cx, cy, k1, k2, p1, p2, k3);
         raw = std::move(result.image);
+
+        reload_.roiX = result.roiX; reload_.roiY = result.roiY;
+        reload_.roiW = result.width; reload_.roiH = result.height;
+
         if (!rawMask.empty())
             rawMask = undistortMask(rawMask, fx, fy, cx, cy, k1, k2, p1, p2, k3,
                                     result.roiX, result.roiY, result.width, result.height);
@@ -243,7 +256,143 @@ void Camera::loadImage(float downscaleFactor, const std::string &maskDir) {
     if (!rawMask.empty()) mask = std::move(rawMask);
 }
 
+void Camera::loadMetadataOnly(float downscaleFactor, const std::string &maskDir) {
+    int metaW = width, metaH = height;
+
+    // Read actual file dimensions to correct intrinsics when metadata
+    // doesn't match (e.g. --colmap-image-path points to resized copies).
+    int fileW = 0, fileH = 0;
+    if (imageFileDimensions(filePath, fileW, fileH)) {
+        if (metaW <= 0 || metaH <= 0) {
+            metaW = fileW; metaH = fileH;
+            width = fileW; height = fileH;
+        } else if (fileW != metaW || fileH != metaH) {
+            float sx = (float)fileW / (float)metaW;
+            float sy = (float)fileH / (float)metaH;
+            fx *= sx; fy *= sy; cx *= sx; cy *= sy;
+            metaW = fileW; metaH = fileH;
+            width = fileW; height = fileH;
+        }
+    } else if (metaW <= 0 || metaH <= 0) {
+        // Can't determine dimensions at all — fall back to full decode.
+        loadImage(downscaleFactor, maskDir);
+        releaseCPUData();
+        return;
+    }
+
+    // Detect mask file (filename matching only, no pixel decode)
+    std::string maskPath = findMaskPath(filePath, maskDir);
+    if (!maskPath.empty()) {
+        maskPath_ = maskPath;
+    } else if (imageHasAlphaChannel(filePath)) {
+        maskFromAlpha_ = true;
+    }
+
+    // Apply downscale to intrinsics
+    if (downscaleFactor > 1.0f) {
+        int newW = (int)(metaW / downscaleFactor);
+        int newH = (int)(metaH / downscaleFactor);
+        float sx = (float)newW / (float)width;
+        float sy = (float)newH / (float)height;
+        fx *= sx; fy *= sy; cx *= sx; cy *= sy;
+        width = newW; height = newH;
+    }
+
+    // Compute undistortion geometry (no pixel data needed)
+    if (hasDistortion()) {
+        reload_.hadDistortion = true;
+        reload_.k1 = k1; reload_.k2 = k2; reload_.k3 = k3;
+        reload_.p1 = p1; reload_.p2 = p2;
+        reload_.fx = fx; reload_.fy = fy;
+        reload_.cx = cx; reload_.cy = cy;
+        reload_.width = width; reload_.height = height;
+
+        auto roi = computeUndistortROI(width, height, fx, fy, cx, cy, k1, k2, p1, p2, k3);
+
+        reload_.roiX = roi.roiX; reload_.roiY = roi.roiY;
+        reload_.roiW = roi.width; reload_.roiH = roi.height;
+
+        fx = roi.fx; fy = roi.fy;
+        cx = roi.cx; cy = roi.cy;
+        width = roi.width; height = roi.height;
+        k1 = k2 = k3 = p1 = p2 = 0;
+    }
+}
+
+void Camera::reloadImage() {
+    if (filePath.empty() || !image.empty()) return;
+
+    // Use maxDim=0 (full decode) to match the original loadImage path exactly.
+    // The thumbnail decode path (maxDim>0) can produce subtly different pixels.
+    Image raw = imreadRGB(filePath, 0);
+    if (raw.empty()) return;
+
+    if (reload_.hadDistortion) {
+        if (raw.width != reload_.width || raw.height != reload_.height)
+            raw = resizeArea(raw, reload_.width, reload_.height);
+        auto result = undistortImage(raw,
+            reload_.fx, reload_.fy, reload_.cx, reload_.cy,
+            reload_.k1, reload_.k2, reload_.p1, reload_.p2, reload_.k3);
+        raw = std::move(result.image);
+        // Ensure exact match (ROI crop may differ by ±1px across runs)
+        if (raw.width != width || raw.height != height)
+            raw = resizeArea(raw, width, height);
+    } else {
+        if (raw.width != width || raw.height != height)
+            raw = resizeArea(raw, width, height);
+    }
+
+    image = std::move(raw);
+}
+
+void Camera::reloadMask() {
+    if (!mask.empty()) return;
+    if (maskPath_.empty() && !maskFromAlpha_) return;
+
+    // Use maxDim=0 (full decode) to match the original loadImage path.
+    Mask rawMask;
+    if (!maskPath_.empty())
+        rawMask = imreadMask(maskPath_, 0);
+    else
+        rawMask = imreadAlphaMask(filePath, 0);
+    if (rawMask.empty()) {
+        // Alpha channel exists but is fully opaque — not a real mask.
+        maskFromAlpha_ = false;
+        return;
+    }
+
+    if (reload_.hadDistortion) {
+        if (rawMask.width != reload_.width || rawMask.height != reload_.height)
+            rawMask = resizeAreaMask(rawMask, reload_.width, reload_.height);
+        rawMask = undistortMask(rawMask,
+            reload_.fx, reload_.fy, reload_.cx, reload_.cy,
+            reload_.k1, reload_.k2, reload_.p1, reload_.p2, reload_.k3,
+            reload_.roiX, reload_.roiY, reload_.roiW, reload_.roiH);
+        if (rawMask.width != width || rawMask.height != height)
+            rawMask = resizeAreaMask(rawMask, width, height);
+    } else {
+        if (rawMask.width != width || rawMask.height != height)
+            rawMask = resizeAreaMask(rawMask, width, height);
+    }
+
+    mask = std::move(rawMask);
+}
+
 Image Camera::getImage(int downscaleFactor) {
+    // If base image was released and we need a downscaled version,
+    // reload directly at target size without storing the full-res base.
+    if (image.empty() && !filePath.empty() && downscaleFactor > 1) {
+        auto it = imagePyramids.find(downscaleFactor);
+        if (it != imagePyramids.end()) return it->second;
+        reloadImage();
+        int newW = image.width / downscaleFactor;
+        int newH = image.height / downscaleFactor;
+        Image scaled = resizeArea(image, newW, newH);
+        image.data.clear(); image.data.shrink_to_fit();  // don't keep full-res
+        imagePyramids[downscaleFactor] = std::move(scaled);
+        return imagePyramids[downscaleFactor];
+    }
+    if (image.empty() && !filePath.empty()) reloadImage();
     if (downscaleFactor <= 1) return image;
 
     auto it = imagePyramids.find(downscaleFactor);
@@ -267,6 +416,19 @@ MTensor& Camera::getGPUImage(int downscaleFactor) {
 }
 
 Mask Camera::getMask(int downscaleFactor) {
+    if (mask.empty() && (maskPath_.size() || maskFromAlpha_) && downscaleFactor > 1) {
+        auto it = maskPyramids.find(downscaleFactor);
+        if (it != maskPyramids.end()) return it->second;
+        reloadMask();
+        if (mask.empty()) return {};
+        int newW = mask.width / downscaleFactor;
+        int newH = mask.height / downscaleFactor;
+        Mask scaled = resizeAreaMask(mask, newW, newH);
+        mask.data.clear(); mask.data.shrink_to_fit();
+        maskPyramids[downscaleFactor] = std::move(scaled);
+        return maskPyramids[downscaleFactor];
+    }
+    if (mask.empty()) reloadMask();
     if (mask.empty()) return {};
     if (downscaleFactor <= 1) return mask;
 

@@ -173,16 +173,16 @@ int main(int argc, char *argv[]) {
             dispatch_apply(total, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
                 ^(size_t i) {
                     try {
-                        cams[i].loadImage(dsf, md);
+                        cams[i].loadMetadataOnly(dsf, md);
                     } catch (...) {
                         *errPtr = std::current_exception();
                         return;
                     }
                     size_t done = loadedPtr->fetch_add(1, std::memory_order_relaxed) + 1;
                     if (done % 10 == 0 || done == total)
-                        fprintf(stderr, "\rLoading images ... %zu/%zu", done, total);
+                        fprintf(stderr, "\rPreparing cameras ... %zu/%zu", done, total);
                 });
-            fprintf(stderr, "\rLoading images ... %zu/%zu\n", total, total);
+            fprintf(stderr, "\rPreparing cameras ... %zu/%zu\n", total, total);
             if (loadErr) std::rethrow_exception(loadErr);
         }
 
@@ -254,6 +254,7 @@ int main(int argc, char *argv[]) {
             auto iter_start = cpu_now();
             MTensor gt = cam.getGPUImage(model.getDownscaleFactor(step));
             MTensor *maskPtr = cam.hasMask() ? &cam.getGPUMask(model.getDownscaleFactor(step)) : nullptr;
+            cam.releaseCPUData();  // free reloaded pixels after GPU upload
             model.fullIteration(cam, step, gt, ssimWeight, maskPtr);
             model.schedulersStep(step);
             model.applyMaskOpacityPenalty(cams, step);

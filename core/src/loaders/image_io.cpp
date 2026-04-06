@@ -78,6 +78,49 @@ static DecodedRGBA8 decodeRGBA8PreservingAlpha(const std::string &path, int maxD
 
 } // namespace
 
+// ── Metadata-only alpha check ────────────────────────────────────────────────
+
+bool imageHasAlphaChannel(const std::string &path) {
+    // Decode a small thumbnail to check if alpha is actually non-opaque.
+    // A tiny decode (64px) is fast and avoids false positives from RGBA
+    // files whose alpha plane is entirely 255.
+    try {
+        DecodedRGBA8 decoded = decodeRGBA8PreservingAlpha(path, 64);
+        if (!decoded.hasAlpha) return false;
+        int n = decoded.width * decoded.height;
+        for (int i = 0; i < n; i++)
+            if (decoded.rgba[i * 4 + 3] < 255) return true;
+        return false;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool imageFileDimensions(const std::string &path, int &outW, int &outH) {
+    CFStringRef cfPath = CFStringCreateWithCString(nullptr, path.c_str(), kCFStringEncodingUTF8);
+    CFURLRef url = CFURLCreateWithFileSystemPath(nullptr, cfPath, kCFURLPOSIXPathStyle, false);
+    CFRelease(cfPath);
+
+    CGImageSourceRef source = CGImageSourceCreateWithURL(url, nullptr);
+    CFRelease(url);
+    if (!source) return false;
+
+    CFDictionaryRef props = CGImageSourceCopyPropertiesAtIndex(source, 0, nullptr);
+    CFRelease(source);
+    if (!props) return false;
+
+    CFNumberRef wRef = (CFNumberRef)CFDictionaryGetValue(props, kCGImagePropertyPixelWidth);
+    CFNumberRef hRef = (CFNumberRef)CFDictionaryGetValue(props, kCGImagePropertyPixelHeight);
+    bool ok = false;
+    if (wRef && hRef) {
+        CFNumberGetValue(wRef, kCFNumberIntType, &outW);
+        CFNumberGetValue(hRef, kCFNumberIntType, &outH);
+        ok = (outW > 0 && outH > 0);
+    }
+    CFRelease(props);
+    return ok;
+}
+
 // ── Image loading (CoreGraphics) ─────────────────────────────────────────────
 
 Image imreadRGB(const std::string &path, int maxDim) {
@@ -368,80 +411,59 @@ static void bilinearSample(const Image &img, float x, float y, float out[3]) {
     }
 }
 
+UndistortROI computeUndistortROI(int w, int h,
+    float fx, float fy, float cx, float cy,
+    float k1, float k2, float p1, float p2, float k3)
+{
+    int nSamples = 200;
+    float topMax = -1e9f, bottomMin = 1e9f, leftMax = -1e9f, rightMin = 1e9f;
+    for (int i = 0; i < nSamples; i++) {
+        float t = (float)i / (nSamples - 1);
+
+        float xd = (t * w - cx) / fx, yd = (0.0f - cy) / fy;
+        float xu, yu;
+        undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
+        topMax = std::max(topMax, yu * fy + cy);
+
+        xd = (t * w - cx) / fx; yd = ((float)(h-1) - cy) / fy;
+        undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
+        bottomMin = std::min(bottomMin, yu * fy + cy);
+
+        xd = (0.0f - cx) / fx; yd = (t * h - cy) / fy;
+        undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
+        leftMax = std::max(leftMax, xu * fx + cx);
+
+        xd = ((float)(w-1) - cx) / fx; yd = (t * h - cy) / fy;
+        undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
+        rightMin = std::min(rightMin, xu * fx + cx);
+    }
+
+    int roiX = std::max(0, (int)std::ceil(leftMax));
+    int roiY = std::max(0, (int)std::ceil(topMax));
+    int roiW = std::min(w, (int)std::floor(rightMin)) - roiX;
+    int roiH = std::min(h, (int)std::floor(bottomMin)) - roiY;
+    if (roiW <= 0 || roiH <= 0) { roiX = 0; roiY = 0; roiW = w; roiH = h; }
+
+    UndistortROI roi;
+    roi.fx = fx;
+    roi.fy = fy;
+    roi.cx = cx - roiX;
+    roi.cy = cy - roiY;
+    roi.width = roiW;
+    roi.height = roiH;
+    roi.roiX = roiX;
+    roi.roiY = roiY;
+    return roi;
+}
+
 UndistortResult undistortImage(const Image &src,
     float fx, float fy, float cx, float cy,
     float k1, float k2, float p1, float p2, float k3)
 {
     int w = src.width, h = src.height;
 
-    // Find valid region by undistorting boundary points of the source image.
-    // For each point on the distorted boundary, find its undistorted position.
-    // The inner rectangle of all undistorted boundary points = valid region (alpha=0).
-    float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
-    int nSamples = 200;
-    for (int i = 0; i < nSamples; i++) {
-        float t = (float)i / (nSamples - 1);
-        // Four edges of the distorted image
-        float edges[][2] = {
-            {t * w, 0.0f},          // top
-            {t * w, (float)(h-1)},  // bottom
-            {0.0f, t * h},          // left
-            {(float)(w-1), t * h},  // right
-        };
-        for (auto &pt : edges) {
-            float xd = (pt[0] - cx) / fx;
-            float yd = (pt[1] - cy) / fy;
-            float xu, yu;
-            undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
-            // Back to pixel coords using original intrinsics as the "new" camera
-            float pu = xu * fx + cx;
-            float pv = yu * fy + cy;
-            minX = std::min(minX, pu);
-            maxX = std::max(maxX, pu);
-            minY = std::min(minY, pv);
-            maxY = std::max(maxY, pv);
-        }
-    }
-
-    // Inner rectangle: clamp to image bounds and take the inner edges
-    // For top/left edges: take the max (inner boundary)
-    // For bottom/right edges: take the min (inner boundary)
-    // But we need to separate inner from outer per edge...
-    // Top edge gives us maxY from top → that's minY constraint
-    // Bottom edge gives us minY from bottom → that's maxY constraint
-    // Actually, let me resample per-edge:
-    float topMax = -1e9f, bottomMin = 1e9f, leftMax = -1e9f, rightMin = 1e9f;
-    for (int i = 0; i < nSamples; i++) {
-        float t = (float)i / (nSamples - 1);
-
-        // Top edge: all points along y=0
-        float xd = (t * w - cx) / fx, yd = (0.0f - cy) / fy;
-        float xu, yu;
-        undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
-        topMax = std::max(topMax, yu * fy + cy);
-
-        // Bottom edge: all points along y=h-1
-        xd = (t * w - cx) / fx; yd = ((float)(h-1) - cy) / fy;
-        undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
-        bottomMin = std::min(bottomMin, yu * fy + cy);
-
-        // Left edge: all points along x=0
-        xd = (0.0f - cx) / fx; yd = (t * h - cy) / fy;
-        undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
-        leftMax = std::max(leftMax, xu * fx + cx);
-
-        // Right edge: all points along x=w-1
-        xd = ((float)(w-1) - cx) / fx; yd = (t * h - cy) / fy;
-        undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
-        rightMin = std::min(rightMin, xu * fx + cx);
-    }
-
-    // Inner rectangle (alpha=0: no black borders)
-    int roiX = std::max(0, (int)std::ceil(leftMax));
-    int roiY = std::max(0, (int)std::ceil(topMax));
-    int roiW = std::min(w, (int)std::floor(rightMin)) - roiX;
-    int roiH = std::min(h, (int)std::floor(bottomMin)) - roiY;
-    if (roiW <= 0 || roiH <= 0) { roiX = 0; roiY = 0; roiW = w; roiH = h; }
+    UndistortROI roi = computeUndistortROI(w, h, fx, fy, cx, cy, k1, k2, p1, p2, k3);
+    int roiX = roi.roiX, roiY = roi.roiY, roiW = roi.width, roiH = roi.height;
 
     // Undistort: for each pixel in the output (undistorted) image,
     // apply forward distortion to find source pixel in distorted input.
