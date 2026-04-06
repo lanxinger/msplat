@@ -994,6 +994,7 @@ kernel void rasterize_backward_kernel(
     device atomic_float* v_conic, // float3
     device atomic_float* v_rgb, // float3
     device atomic_float* v_opacity,
+    constant float* out_img,          // forward output (post-saturate)
     uint3 gp [[thread_position_in_grid]],
     uint3 blockIdx [[threadgroup_position_in_grid]],
     uint tr [[thread_index_in_threadgroup]],
@@ -1032,8 +1033,11 @@ kernel void rasterize_backward_kernel(
     threadgroup float3 conic_batch[RAST_BLOCK_SIZE];
     threadgroup float3 rgbs_batch[RAST_BLOCK_SIZE];
 
-    // df/d_out for this pixel
-    const float3 v_out = read_packed_float3(v_output, pix_id);
+    // df/d_out for this pixel — apply derivative of forward saturate() clamp:
+    // zero gradient for channels clamped at 1.0 (overbright)
+    const float3 clamped_rgb = read_packed_float3(out_img, pix_id);
+    const float3 sat_mask = select(float3(1.f), float3(0.f), clamped_rgb >= 1.f);
+    const float3 v_out = sat_mask * read_packed_float3(v_output, pix_id);
     const float v_alpha_pix = inside ? v_alpha_img[pix_id] : 0.f;
     // Hoist loop-invariant background load and T_final * bg product
     const float3 bg = {background[0], background[1], background[2]};
@@ -1164,6 +1168,10 @@ kernel void rasterize_backward_kernel(
                     float pixel_error = densify_error_map[pix_id];
                     densify_vis_local = fac;
                     densify_score_local = fac * pixel_error;
+                } else if (densification_mode == 2) {
+                    float final_a = max(1.0f - final_Ts[pix_id], 1e-5f);
+                    densify_vis_local = fac;
+                    densify_score_local = length(v_xy_local * float2(img_size)) / final_a;
                 }
             }
 
@@ -1188,7 +1196,7 @@ kernel void rasterize_backward_kernel(
                 atomic_fetch_add_explicit(v_xy + 2*b_id + 1, v_xy_local.y, memory_order_relaxed);
 
                 atomic_fetch_add_explicit(v_opacity + b_id, v_opacity_local, memory_order_relaxed);
-                if (densification_mode == 1) {
+                if (densification_mode == 1 || densification_mode == 2) {
                     atomic_fetch_add_explicit(densify_vis + b_id, densify_vis_local, memory_order_relaxed);
                     atomic_fetch_add_explicit(densify_score + b_id, densify_score_local, memory_order_relaxed);
                 }
@@ -2207,6 +2215,8 @@ kernel void pack_sorted_gaussians_kernel(
 
 #define SORT_TG_SIZE 256
 #define MAX_TILE_ELEMS 4096
+#define OVERFLOW_TILE_ELEMS 1u
+#define OVERFLOW_PACKED_CAPACITY 2u
 
 // Scatter each gaussian's intersections directly into pre-allocated per-tile bins.
 // Each tile gets MAX_TILE_ELEMS slots. Per-tile atomics track fill count.
@@ -2238,7 +2248,7 @@ kernel void scatter_to_prealloc_bins_kernel(
             if (pos >= MAX_TILE_ELEMS) {
                 // Clamp counter so prefix_sum sees at most MAX_TILE_ELEMS
                 atomic_store_explicit(&scatter_counters[tile_id], MAX_TILE_ELEMS, memory_order_relaxed);
-                atomic_store_explicit(overflow_flag, 1u, memory_order_relaxed);
+                atomic_fetch_or_explicit(overflow_flag, OVERFLOW_TILE_ELEMS, memory_order_relaxed);
                 continue;
             }
             prealloc_bins[(uint64_t)tile_id * MAX_TILE_ELEMS + pos] = ((uint64_t)depth_bits << 32) | (uint64_t)idx;
@@ -2264,6 +2274,8 @@ kernel void bitonic_sort_per_tile_kernel(
     device float* packed_conic          [[buffer(10)]],
     device float* packed_rgb            [[buffer(11)]],
     device int* tile_bins               [[buffer(12)]],
+    constant uint& output_capacity      [[buffer(13)]],
+    device atomic_uint* overflow_flag   [[buffer(14)]],
     uint tg_id [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]]
 ) {
@@ -2273,13 +2285,19 @@ kernel void bitonic_sort_per_tile_kernel(
     int count = min(count_raw, MAX_TILE_ELEMS);
     int end = tile_offsets[tg_id];
     int start = end - count;
+    int clipped_start = min(start, (int)output_capacity);
+    int clipped_end = min(end, (int)output_capacity);
+    int clipped_count = max(0, clipped_end - clipped_start);
 
     // Write tile_bins for rasterizer
     if (tid == 0) {
-        write_packed_int2(tile_bins, tg_id, int2(start, end));
+        write_packed_int2(tile_bins, tg_id, int2(clipped_start, clipped_end));
+        if (clipped_count < count) {
+            atomic_fetch_or_explicit(overflow_flag, OVERFLOW_PACKED_CAPACITY, memory_order_relaxed);
+        }
     }
 
-    if (count == 0) return;
+    if (count == 0 || clipped_count == 0) return;
 
     // Round up to next power of 2
     int n = 1;
@@ -2313,9 +2331,9 @@ kernel void bitonic_sort_per_tile_kernel(
     }
 
     // Fused sort+pack: extract gaussian IDs, read per-gaussian data, write packed buffers
-    for (int i = (int)tid; i < count; i += SORT_TG_SIZE) {
+    for (int i = (int)tid; i < clipped_count; i += SORT_TG_SIZE) {
         int32_t g_id = (int32_t)(data[i] & 0xFFFFFFFF);
-        int global_idx = start + i;
+        int global_idx = clipped_start + i;
         gaussian_ids_out[global_idx] = g_id;
         float2 xy = read_packed_float2(xys, g_id);
         float opac = 1.f / (1.f + exp(-opacities[g_id]));
@@ -2579,23 +2597,30 @@ kernel void block_reduce_kernel(
     }
 }
 
-// Multi-threadgroup prefix sum, pass 2: each threadgroup computes its block
-// offset from block_totals, then writes inclusive prefix sums with coalesced access.
+// Multi-threadgroup prefix sum, pass 2: each threadgroup reads the inclusive
+// prefix of prior block totals, then writes inclusive prefix sums with
+// coalesced access across its own 1024-element block.
 kernel void block_scan_propagate_kernel(
     constant uint& N,
     constant int* input,
     device int* output,
     constant int* block_totals,
+    constant int& block_totals_scanned,
     uint tg_id [[threadgroup_position_in_grid]],
     uint tg_tid [[thread_position_in_threadgroup]],
     uint sg_id [[simdgroup_index_in_threadgroup]],
     uint sg_lane [[thread_index_in_simdgroup]],
     uint sg_size [[threads_per_simdgroup]]
 ) {
-    // Step 1: Compute block offset (sum of all preceding block totals)
+    // Step 1: Read the scanned prefix when available, otherwise fall back to
+    // summing raw block totals for large block-count cases.
     int block_offset = 0;
-    for (uint i = 0; i < tg_id; i++) {
-        block_offset += block_totals[i];
+    if (block_totals_scanned != 0) {
+        block_offset = (tg_id == 0) ? 0 : block_totals[tg_id - 1];
+    } else {
+        for (uint i = 0; i < tg_id; i++) {
+            block_offset += block_totals[i];
+        }
     }
 
     // Step 2: Load element (coalesced)
@@ -3055,6 +3080,7 @@ kernel void rasterize_backward_chunked_kernel(
     device atomic_float* v_opacity,
     constant uint& chunk_size,
     constant uint& K_max,
+    constant float* out_img,          // forward output (post-saturate)
     uint3 gp [[thread_position_in_grid]],
     uint3 blockIdx [[threadgroup_position_in_grid]],
     uint tr [[thread_index_in_threadgroup]],
@@ -3089,7 +3115,10 @@ kernel void rasterize_backward_chunked_kernel(
     float T_final = final_Ts[pix_id];
     const float3 bg = {background[0], background[1], background[2]};
     const float3 T_final_bg = T_final * bg;
-    const float3 v_out = read_packed_float3(v_output, pix_id);
+    // Apply derivative of forward saturate() clamp: zero gradient for overbright channels
+    const float3 clamped_rgb = read_packed_float3(out_img, pix_id);
+    const float3 sat_mask = select(float3(1.f), float3(0.f), clamped_rgb >= 1.f);
+    const float3 v_out = sat_mask * read_packed_float3(v_output, pix_id);
     const float v_alpha_pix = inside ? v_alpha_img[pix_id] : 0.f;
 
     const int bin_final = inside ? chunk_final_idx[chunk_offset] : -1;
@@ -3209,6 +3238,10 @@ kernel void rasterize_backward_chunked_kernel(
                     float pixel_error = densify_error_map[pix_id];
                     densify_vis_local = fac;
                     densify_score_local = fac * pixel_error;
+                } else if (densification_mode == 2) {
+                    float final_a = max(1.0f - final_Ts[pix_id], 1e-5f);
+                    densify_vis_local = fac;
+                    densify_score_local = length(v_xy_local * float2(img_size)) / final_a;
                 }
             }
 
@@ -3229,7 +3262,7 @@ kernel void rasterize_backward_chunked_kernel(
                 atomic_fetch_add_explicit(v_xy + 2*b_id + 0, v_xy_local.x, memory_order_relaxed);
                 atomic_fetch_add_explicit(v_xy + 2*b_id + 1, v_xy_local.y, memory_order_relaxed);
                 atomic_fetch_add_explicit(v_opacity + b_id, v_opacity_local, memory_order_relaxed);
-                if (densification_mode == 1) {
+                if (densification_mode == 1 || densification_mode == 2) {
                     atomic_fetch_add_explicit(densify_vis + b_id, densify_vis_local, memory_order_relaxed);
                     atomic_fetch_add_explicit(densify_score + b_id, densify_score_local, memory_order_relaxed);
                 }
@@ -4095,6 +4128,17 @@ kernel void hybrid_refine_kernel(
     for (int c = 0; c < 3; c++) { adam_ea3[donor*3+c] = 0; adam_es3[donor*3+c] = 0; }
     for (int c = 0; c < fr_stride; c++) { adam_ea4[donor*fr_stride+c] = 0; adam_es4[donor*fr_stride+c] = 0; }
     adam_ea5[donor] = 0; adam_es5[donor] = 0;
+}
+
+kernel void accumulate_refine_max_kernel(
+    constant uint& N [[buffer(0)]],
+    device float* step_refine_score [[buffer(1)]],
+    device float* refine_weight_max [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= N) return;
+    refine_weight_max[gid] = max(refine_weight_max[gid], step_refine_score[gid]);
+    step_refine_score[gid] = 0.0f;
 }
 
 // ============================================================================

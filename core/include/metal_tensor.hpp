@@ -46,15 +46,16 @@ public:
 
 #ifdef __OBJC__
     // GPU allocation (Objective-C++ only) — creates an owning tensor.
-    MTensor(id<MTLDevice> device, std::vector<int64_t> shape, DType dtype)
+    MTensor(id<MTLDevice> device, std::vector<int64_t> shape, DType dtype,
+            MTLResourceOptions options = MTLResourceStorageModeShared)
         : _shape(std::move(shape)), _dtype(dtype), _owning(true) {
         _numel = 1;
         for (auto s : _shape) _numel *= s;
         size_t bytes = _numel * dtypeSize(_dtype);
         if (bytes == 0) bytes = 4;
-        id<MTLBuffer> buf = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf = [device newBufferWithLength:bytes options:options];
         _buffer = (__bridge void*)buf;  // non-ARC: newBuffer already +1 retained, CFRelease handles release
-        _data = [buf contents];  // cache CPU-accessible pointer for C++ access
+        _data = [buf contents];  // nil for private storage
     }
 
     id<MTLBuffer> buffer() const { return (__bridge id<MTLBuffer>)_buffer; }
@@ -136,10 +137,12 @@ public:
 
     void* data_ptr() {
         if (_data) return _data;
+        assert(_buffer == nullptr && "CPU access requested for a GPU-private MTensor");
         return _cpu_data.data();
     }
     const void* data_ptr() const {
         if (_data) return _data;
+        assert(_buffer == nullptr && "CPU access requested for a GPU-private MTensor");
         return _cpu_data.data();
     }
 
@@ -217,6 +220,10 @@ inline MTensor mtensor_zeros(id<MTLDevice> dev, std::vector<int64_t> shape, DTyp
     MTensor t(dev, std::move(shape), dt);
     t.zero();
     return t;
+}
+
+inline MTensor mtensor_empty_private(id<MTLDevice> dev, std::vector<int64_t> shape, DType dt) {
+    return MTensor(dev, std::move(shape), dt, MTLResourceStorageModePrivate);
 }
 #endif
 

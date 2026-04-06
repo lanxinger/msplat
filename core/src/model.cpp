@@ -191,6 +191,9 @@ void schedulersStepClassicOrHybrid(Model &model, int step) {
 void afterTrainClassicOrHybrid(Model &model, int step) {
     if (!model.radii.defined()) return;
     const bool refineStep = step % model.refineEvery == 0 && step > model.warmupLength;
+    if (model.strategy == Strategy::Hybrid && model.xysGradNorm.defined() && model.refineWeightMax.defined()) {
+        msplat_accumulate_refine_max(model.num_active, model.xysGradNorm, model.refineWeightMax);
+    }
     if (refineStep) {
         int resetInterval = model.resetAlphaEvery * model.refineEvery;
         bool doDensification = step < model.stopSplitAt
@@ -258,17 +261,24 @@ void afterTrainClassicOrHybrid(Model &model, int step) {
 
         float *op = model.opacities.data<float>();
         float *sc = model.scales.data<float>();
+        float *mn = model.means.data<float>();
         int n = model.num_active;
         std::vector<float> savedVisCounts(n, 0.0f);
         std::vector<float> savedGradWeights(n, 0.0f);
-        if (model.xysGradNorm.defined() && model.visCounts.defined()) {
-            float half_max_dim = 0.5f * static_cast<float>((std::max)(model.lastWidth, model.lastHeight));
-            const float *gn = model.xysGradNorm.data<float>();
+        if (model.refineWeightMax.defined() && model.visCounts.defined()) {
+            const float *gn = model.refineWeightMax.data<float>();
             const float *vc = model.visCounts.data<float>();
             for (int i = 0; i < n; ++i) {
                 savedVisCounts[i] = vc[i];
-                savedGradWeights[i] = (vc[i] > 0.0f) ? (gn[i] / vc[i]) * half_max_dim : 0.0f;
+                savedGradWeights[i] = (vc[i] > 0.0f) ? gn[i] : 0.0f;
             }
+        }
+
+        if (!model.boundsValid) {
+            model.computeBounds();
+            mn = model.means.data<float>();
+            sc = model.scales.data<float>();
+            op = model.opacities.data<float>();
         }
 
         if (minus_opac > 0 || scale_factor < 1.0f) {
@@ -285,7 +295,6 @@ void afterTrainClassicOrHybrid(Model &model, int step) {
         int dst = 0;
         std::vector<float> compactVis(pre_prune, 0.0f);
         std::vector<float> compactGrad(pre_prune, 0.0f);
-        float *mn = model.means.data<float>();
         float *qt = model.quats.data<float>();
         float *dc = model.featuresDc.data<float>();
         float *fr = model.featuresRest.data<float>();
@@ -303,8 +312,14 @@ void afterTrainClassicOrHybrid(Model &model, int step) {
             float s0 = std::exp(sc[i*3]), s1 = std::exp(sc[i*3+1]), s2 = std::exp(sc[i*3+2]);
             float max_s = std::max({s0, s1, s2});
             float min_s = std::min({s0, s1, s2});
+            float dx = mn[i*3] - model.bounds.center[0];
+            float dy = mn[i*3+1] - model.bounds.center[1];
+            float dz = mn[i*3+2] - model.bounds.center[2];
+            float dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+            float scale_limit = model.boundsValid ? model.bounds.maxExtent * 100.0f : model.scale * 100.0f;
+            float dist_limit = model.boundsValid ? model.bounds.maxExtent * 100.0f : std::numeric_limits<float>::infinity();
 
-            bool dead = sig < MIN_OPACITY || min_s < 1e-10f || max_s > model.scale * 100.0f;
+            bool dead = sig < MIN_OPACITY || min_s < 1e-10f || max_s > scale_limit || dist > dist_limit;
             if (dead) continue;
 
             compactVis[dst] = savedVisCounts[i];
@@ -425,6 +440,8 @@ void afterTrainClassicOrHybrid(Model &model, int step) {
             }
         }
 
+        model.computeBounds();
+
         std::cout << "Hybrid refine: " << pre_prune << " -> " << model.num_active << " gaussians"
                   << " (pruned=" << pruned
                   << ", above=" << above_threshold_count
@@ -438,6 +455,7 @@ void afterTrainClassicOrHybrid(Model &model, int step) {
         model.xysGradNorm.reset();
         model.visCounts.reset();
         model.max2DSize.reset();
+        if (model.refineWeightMax.defined()) model.refineWeightMax.zero();
     }
 }
 
@@ -1067,16 +1085,16 @@ void Model::setupOptimizers(){
     meansLrGamma = std::pow((double)means_lr_final / (double)means_lr_init, 1.0 / std::max(1, maxSteps));
     adam_lr[0] = meansLrUnscaled;
 
-    densify_split_flag = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_dup_flag = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_split_prefix = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_dup_prefix = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_keep_flag = gpu_zeros({buf_capacity}, DType::Int32);
+    densify_split_flag = gpu_empty_private({buf_capacity}, DType::Int32);
+    densify_dup_flag = gpu_empty_private({buf_capacity}, DType::Int32);
+    densify_split_prefix = gpu_empty_private({buf_capacity}, DType::Int32);
+    densify_dup_prefix = gpu_empty_private({buf_capacity}, DType::Int32);
+    densify_keep_flag = gpu_empty_private({buf_capacity}, DType::Int32);
     densify_keep_prefix = gpu_zeros({buf_capacity}, DType::Int32);
     int max_blocks = (buf_capacity + 1023) / 1024;
-    densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
+    densify_block_totals = gpu_empty_private({max_blocks}, DType::Int32);
     int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
-    densify_compact_scratch = gpu_zeros({(int64_t)buf_capacity * fr_stride}, DType::Float32);
+    densify_compact_scratch = gpu_empty_private({(int64_t)buf_capacity * fr_stride}, DType::Float32);
     densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
     refineWeightMax = gpu_zeros({buf_capacity}, DType::Float32);
     errorScoreMax = gpu_zeros({buf_capacity}, DType::Float32);
@@ -1154,16 +1172,16 @@ void Model::ensureCapacity(int needed){
         grow(adam_exp_avg_buf[g]);
         grow(adam_exp_avg_sq_buf[g]);
     }
-    densify_split_flag = gpu_zeros({new_cap}, DType::Int32);
-    densify_dup_flag = gpu_zeros({new_cap}, DType::Int32);
-    densify_split_prefix = gpu_zeros({new_cap}, DType::Int32);
-    densify_dup_prefix = gpu_zeros({new_cap}, DType::Int32);
-    densify_keep_flag = gpu_zeros({new_cap}, DType::Int32);
+    densify_split_flag = gpu_empty_private({new_cap}, DType::Int32);
+    densify_dup_flag = gpu_empty_private({new_cap}, DType::Int32);
+    densify_split_prefix = gpu_empty_private({new_cap}, DType::Int32);
+    densify_dup_prefix = gpu_empty_private({new_cap}, DType::Int32);
+    densify_keep_flag = gpu_empty_private({new_cap}, DType::Int32);
     densify_keep_prefix = gpu_zeros({new_cap}, DType::Int32);
     int max_blocks = (new_cap + 1023) / 1024;
-    densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
+    densify_block_totals = gpu_empty_private({max_blocks}, DType::Int32);
     int64_t fr_stride = featuresRest_buf.stride0();
-    densify_compact_scratch = gpu_zeros({(int64_t)new_cap * fr_stride}, DType::Float32);
+    densify_compact_scratch = gpu_empty_private({(int64_t)new_cap * fr_stride}, DType::Float32);
     densify_random_samples = gpu_zeros({new_cap, 3}, DType::Float32);
     {
         MTensor new_refine = gpu_zeros({new_cap}, DType::Float32);
@@ -1600,16 +1618,16 @@ int Model::loadCheckpoint(const std::string &filename) {
     }
 
     // Allocate densification scratch buffers
-    densify_split_flag = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_dup_flag = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_split_prefix = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_dup_prefix = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_keep_flag = gpu_zeros({buf_capacity}, DType::Int32);
+    densify_split_flag = gpu_empty_private({buf_capacity}, DType::Int32);
+    densify_dup_flag = gpu_empty_private({buf_capacity}, DType::Int32);
+    densify_split_prefix = gpu_empty_private({buf_capacity}, DType::Int32);
+    densify_dup_prefix = gpu_empty_private({buf_capacity}, DType::Int32);
+    densify_keep_flag = gpu_empty_private({buf_capacity}, DType::Int32);
     densify_keep_prefix = gpu_zeros({buf_capacity}, DType::Int32);
     int max_blocks = (buf_capacity + 1023) / 1024;
-    densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
+    densify_block_totals = gpu_empty_private({max_blocks}, DType::Int32);
     int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
-    densify_compact_scratch = gpu_zeros({(int64_t)buf_capacity * fr_stride}, DType::Float32);
+    densify_compact_scratch = gpu_empty_private({(int64_t)buf_capacity * fr_stride}, DType::Float32);
     densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
     refineWeightMax = gpu_zeros({buf_capacity}, DType::Float32);
     errorScoreMax = gpu_zeros({buf_capacity}, DType::Float32);
@@ -1717,7 +1735,7 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight, 
 
     float invMaxDim = 1.0f / static_cast<float>((std::max)(lastHeight, lastWidth));
     float lossInvN = 1.0f / (float)(s.height * s.width * 3);
-    int densificationMode = strategyUsesHybridRefine(strategy) ? 1 : 0;
+    int densificationMode = strategy == Strategy::Hybrid ? 2 : (strategyUsesHybridRefine(strategy) ? 1 : 0);
     MTensor trainBackground = backgroundColor;
 
     auto [r, loss] = msplat_train_step(

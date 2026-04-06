@@ -17,6 +17,7 @@ void* msplat_device();
 // GPU tensor allocation (callable from C++ — delegates to Metal device)
 MTensor gpu_zeros(std::vector<int64_t> shape, DType dtype);
 MTensor gpu_empty(std::vector<int64_t> shape, DType dtype);
+MTensor gpu_empty_private(std::vector<int64_t> shape, DType dtype);
 
 // Commit current command buffer (non-blocking)
 void msplat_commit();
@@ -131,6 +132,12 @@ void msplat_apply_mean_noise(
     MTensor *vis_counts,
     float median_scale,
     uint32_t step_seed
+);
+
+void msplat_accumulate_refine_max(
+    int N,
+    MTensor &step_refine_score,
+    MTensor &refine_weight_max
 );
 
 #endif

@@ -32,11 +32,15 @@ static const char* g_train_stage_names[] = {
     "loss_fwd_bwd", "rast_bwd", "proj_sh_bwd_adam", "grad_stats"
 };
 static constexpr int N_TRAIN_STAGES = 8;
+static constexpr uint32_t kMaxTileElems = 4096;
+static constexpr uint32_t kOverflowTileElems = 1u << 0;
+static constexpr uint32_t kOverflowPackedCapacity = 1u << 1;
 
 static std::mutex g_stage_timing_mutex;
 // Per-stage accumulated times (ms), indexed by stage
 static std::vector<double> g_stage_times[N_TRAIN_STAGES];
 static int g_stage_report_count = 0;
+static uint32_t g_overflow_warned_mask = 0;
 
 struct MetalContext {
     id<MTLDevice>       device;
@@ -163,6 +167,7 @@ struct MetalContext {
     id<MTLComputePipelineState> compact_scatter_kernel_cpso;
     id<MTLComputePipelineState> compact_copy_back_kernel_cpso;
     id<MTLComputePipelineState> hybrid_refine_kernel_cpso;
+    id<MTLComputePipelineState> accumulate_refine_max_kernel_cpso;
     id<MTLComputePipelineState> long_axis_split_kernel_cpso;
 };
 
@@ -270,6 +275,7 @@ MetalContext* init_msplat_metal_context() {
     ctx->compact_scatter_kernel_cpso              = load(@"compact_scatter_kernel");
     ctx->compact_copy_back_kernel_cpso            = load(@"compact_copy_back_kernel");
     ctx->hybrid_refine_kernel_cpso                = load(@"hybrid_refine_kernel");
+    ctx->accumulate_refine_max_kernel_cpso        = load(@"accumulate_refine_max_kernel");
     ctx->long_axis_split_kernel_cpso              = load(@"long_axis_split_kernel");
 
     [metal_library release];
@@ -311,6 +317,10 @@ MTensor gpu_zeros(std::vector<int64_t> shape, DType dtype) {
 
 MTensor gpu_empty(std::vector<int64_t> shape, DType dtype) {
     return mtensor_empty(get_global_context()->device, std::move(shape), dtype);
+}
+
+MTensor gpu_empty_private(std::vector<int64_t> shape, DType dtype) {
+    return mtensor_empty_private(get_global_context()->device, std::move(shape), dtype);
 }
 
 void msplat_commit() {
@@ -396,39 +406,39 @@ struct FusedTensorCache {
                         id<MTLDevice> dev) {
         if (np != fwd_num_points) {
             fwd_num_points = np;
-            xys = mtensor_empty(dev, {np, 2}, DType::Float32);
-            depths = mtensor_empty(dev, {np}, DType::Float32);
+            xys = mtensor_empty_private(dev, {np, 2}, DType::Float32);
+            depths = mtensor_empty_private(dev, {np}, DType::Float32);
             radii_out = mtensor_empty(dev, {np}, DType::Int32);
-            conics = mtensor_empty(dev, {np, 3}, DType::Float32);
-            num_tiles_hit = mtensor_empty(dev, {np}, DType::Int32);
-            colors = mtensor_empty(dev, {np, 3}, DType::Float32);
-            aabb = mtensor_empty(dev, {np, 2}, DType::Float32);
-            block_totals = mtensor_empty(dev, {(np + 1023) / 1024}, DType::Int32);
+            conics = mtensor_empty_private(dev, {np, 3}, DType::Float32);
+            num_tiles_hit = mtensor_empty_private(dev, {np}, DType::Int32);
+            colors = mtensor_empty_private(dev, {np, 3}, DType::Float32);
+            aabb = mtensor_empty_private(dev, {np, 2}, DType::Float32);
+            block_totals = mtensor_empty_private(dev, {(np + 1023) / 1024}, DType::Int32);
         }
         if (cap != capacity) {
             capacity = cap;
-            gaussian_ids = mtensor_empty(dev, {cap}, DType::Int32);
-            packed_xy_opac = mtensor_empty(dev, {cap, 3}, DType::Float32);
-            packed_conic = mtensor_empty(dev, {cap, 3}, DType::Float32);
-            packed_rgb = mtensor_empty(dev, {cap, 3}, DType::Float32);
+            gaussian_ids = mtensor_empty_private(dev, {cap}, DType::Int32);
+            packed_xy_opac = mtensor_empty_private(dev, {cap, 3}, DType::Float32);
+            packed_conic = mtensor_empty_private(dev, {cap, 3}, DType::Float32);
+            packed_rgb = mtensor_empty_private(dev, {cap, 3}, DType::Float32);
         }
         if (ih != img_height || iw != img_width) {
             img_height = ih; img_width = iw;
             out_img = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
             final_Ts = mtensor_empty(dev, {ih, iw}, DType::Float32);
             final_idx = mtensor_empty(dev, {ih, iw}, DType::Int32);
-            loss_intermediates = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
-            densify_error_map = mtensor_empty(dev, {ih, iw}, DType::Float32);
-            ssim_h_buf = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
-            v_rendered = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
-            v_alpha_img = mtensor_empty(dev, {ih, iw}, DType::Float32);
+            loss_intermediates = mtensor_empty_private(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
+            densify_error_map = mtensor_empty_private(dev, {ih, iw}, DType::Float32);
+            ssim_h_buf = mtensor_empty_private(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
+            v_rendered = mtensor_empty_private(dev, {ih, iw, 3}, DType::Float32);
+            v_alpha_img = mtensor_empty_private(dev, {ih, iw}, DType::Float32);
         }
         if (nt != num_tiles) {
             num_tiles = nt;
-            tile_bins = mtensor_empty(dev, {nt, 2}, DType::Int32);
-            tile_offsets = mtensor_empty(dev, {nt}, DType::Int32);
-            tile_scatter_counters = mtensor_empty(dev, {nt}, DType::Int32);
-            prealloc_bins = mtensor_empty(dev, {(int64_t)nt * 4096}, DType::Int64);
+            tile_bins = mtensor_empty_private(dev, {nt, 2}, DType::Int32);
+            tile_offsets = mtensor_empty_private(dev, {nt}, DType::Int32);
+            tile_scatter_counters = mtensor_empty_private(dev, {nt}, DType::Int32);
+            prealloc_bins = mtensor_empty_private(dev, {(int64_t)nt * 4096}, DType::Int64);
         }
         if (!loss_sum.defined()) {
             loss_sum = mtensor_empty(dev, {1}, DType::Float32);
@@ -441,34 +451,61 @@ struct FusedTensorCache {
     void ensure_chunks(int K, int ih, int iw, id<MTLDevice> dev) {
         if (K <= chunk_K_max && ih == img_height && iw == img_width) return;
         chunk_K_max = K;
-        chunk_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
-        chunk_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
-        chunk_final_idx = mtensor_empty(dev, {K, ih, iw}, DType::Int32);
-        prefix_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
-        after_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
+        chunk_T = mtensor_empty_private(dev, {K, ih, iw}, DType::Float32);
+        chunk_C = mtensor_empty_private(dev, {K, ih, iw, 3}, DType::Float32);
+        chunk_final_idx = mtensor_empty_private(dev, {K, ih, iw}, DType::Int32);
+        prefix_T = mtensor_empty_private(dev, {K, ih, iw}, DType::Float32);
+        after_C = mtensor_empty_private(dev, {K, ih, iw, 3}, DType::Float32);
     }
 
     void ensure_backward(int np, int frb, id<MTLDevice> dev) {
         if (np != bwd_num_points || frb != features_rest_bases || !v_xy.defined()) {
             bwd_num_points = np;
             features_rest_bases = frb;
-            v_xy = mtensor_empty(dev, {np, 2}, DType::Float32);
-            v_conic = mtensor_empty(dev, {np, 3}, DType::Float32);
-            v_colors_rast = mtensor_empty(dev, {np, 3}, DType::Float32);
-            v_opacity = mtensor_empty(dev, {np, 1}, DType::Float32);
-            v_depth = mtensor_empty(dev, {np}, DType::Float32);
-            v_mean3d = mtensor_empty(dev, {np, 3}, DType::Float32);
-            v_scale = mtensor_empty(dev, {np, 3}, DType::Float32);
-            v_quat = mtensor_empty(dev, {np, 4}, DType::Float32);
-            v_features_dc = mtensor_empty(dev, {np, 3}, DType::Float32);
-            v_features_rest = mtensor_empty(dev, {(int64_t)np, (int64_t)frb, 3}, DType::Float32);
+            v_xy = mtensor_empty_private(dev, {np, 2}, DType::Float32);
+            v_conic = mtensor_empty_private(dev, {np, 3}, DType::Float32);
+            v_colors_rast = mtensor_empty_private(dev, {np, 3}, DType::Float32);
+            v_opacity = mtensor_empty_private(dev, {np, 1}, DType::Float32);
+            v_depth = mtensor_empty_private(dev, {np}, DType::Float32);
+            v_mean3d = mtensor_empty_private(dev, {np, 3}, DType::Float32);
+            v_scale = mtensor_empty_private(dev, {np, 3}, DType::Float32);
+            v_quat = mtensor_empty_private(dev, {np, 4}, DType::Float32);
+            v_features_dc = mtensor_empty_private(dev, {np, 3}, DType::Float32);
+            v_features_rest = mtensor_empty_private(dev, {(int64_t)np, (int64_t)frb, 3}, DType::Float32);
         }
     }
 };
 static FusedTensorCache g_tcache;
 
+static void maybe_warn_overflow(MetalContext* ctx, int num_points, int iter_count) {
+    if (!g_tcache.overflow_flag.defined() || g_tcache.fwd_num_points <= 0) return;
+
+    bool num_points_changed = (num_points != g_tcache.fwd_num_points && g_tcache.fwd_num_points > 0);
+    if (!num_points_changed && (iter_count % 100) != 1) return;
+
+    ctx->syncCB();
+    uint32_t flags = (uint32_t)*g_tcache.overflow_flag.data<int32_t>();
+    uint32_t new_flags = flags & ~g_overflow_warned_mask;
+    if (new_flags == 0) return;
+
+    if (new_flags & kOverflowTileElems) {
+        fprintf(stderr,
+                "WARNING: per-tile overflow (>%u gaussians in a tile). "
+                "Some gaussians were dropped from overfull tiles.\n",
+                kMaxTileElems);
+    }
+    if (new_flags & kOverflowPackedCapacity) {
+        fprintf(stderr,
+                "WARNING: packed intersection buffer capacity exceeded. "
+                "Raster work was clipped to the allocated packed buffers.\n");
+    }
+
+    g_overflow_warned_mask |= new_flags;
+}
+
 void cleanup_msplat_metal() {
     g_tcache = FusedTensorCache{};
+    g_overflow_warned_mask = 0;
 }
 
 // Internal forward pipeline — used by both msplat_render and msplat_train_step.
@@ -490,22 +527,9 @@ static void forward_pipeline(
     int tile_bounds_y = std::get<1>(tile_bounds);
     int num_tiles = tile_bounds_x * tile_bounds_y;
 
-    // --- Overflow check: detect per-tile overflow (> 4096 gaussians in a tile) ---
-    // Only warn once to avoid noisy output (per-tile overflow is common at >1M gaussians)
-    static bool overflow_warned = false;
     static int iter_count_oc = 0;
     iter_count_oc++;
-    bool num_points_changed = (num_points != g_tcache.fwd_num_points && g_tcache.fwd_num_points > 0);
-    if (!overflow_warned && g_tcache.overflow_flag.defined() && g_tcache.fwd_num_points > 0
-        && (num_points_changed || (iter_count_oc % 100) == 1)) {
-        ctx->syncCB();
-        int32_t flag_val = *g_tcache.overflow_flag.data<int32_t>();
-        if (flag_val > 0) {
-            fprintf(stderr, "WARNING: per-tile overflow (>4096 gaussians in a tile). "
-                    "Some gaussians were dropped from overfull tiles.\n");
-            overflow_warned = true;
-        }
-    }
+    maybe_warn_overflow(ctx, num_points, iter_count_oc);
     int64_t capacity = (int64_t)num_points * g_tcache.capacity_multiplier;
     uint32_t channels = 3;
 
@@ -620,7 +644,8 @@ static void forward_pipeline(
             ENC_BUF(enc, xys, 5); ENC_BUF(enc, conics, 6);
             ENC_BUF(enc, colors, 7); ENC_BUF(enc, opacities, 8);
             ENC_BUF(enc, packed_xy_opac, 9); ENC_BUF(enc, packed_conic, 10); ENC_BUF(enc, packed_rgb, 11);
-            ENC_BUF(enc, tile_bins, 12);
+            ENC_BUF(enc, tile_bins, 12); ENC_SCALAR(enc, capacity_u32, 13);
+            ENC_BUF(enc, g_tcache.overflow_flag, 14);
             [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
     };
@@ -708,21 +733,14 @@ static void forward_pipeline(
     // Zero cached buffers will be done inside the command encoder via blit.
     // (CPU memset would race with previous CB's GPU reads.)
 
-    // Compute K_max conservatively from CPU-side data (no GPU sync needed).
-    // avg_per_tile = capacity / num_tiles. Use 6x average to cover heavy-tailed
-    // tile distributions. Overestimate is cheap: empty chunks early-exit immediately.
-    // If the densest tile exceeds K_max * CHUNK_SIZE, those gaussians are silently
-    // skipped — but 6x covers typical skew (measured max/avg ratio: ~1.5-2.5x).
+    // Chunked rasterization is bounded by the same hard per-tile cap enforced by
+    // scatter_to_prealloc_bins_kernel. Size K_max against that cap so chunked
+    // low-resolution renders cannot silently skip work due to a host heuristic.
     if (num_tiles >= 400) {
         // High-res: enough tiles for good GPU occupancy, skip chunking
         K_max = 1;
     } else {
-        uint32_t avg_per_tile = (uint32_t)(capacity / std::max(1, num_tiles));
-        uint32_t conservative_max = avg_per_tile * 6;  // 6x average — covers heavy-tailed distributions
-        K_max = (conservative_max + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        if (K_max < 2) K_max = 2;
-        uint32_t abs_max = (uint32_t)((capacity + CHUNK_SIZE - 1) / CHUNK_SIZE);
-        if (K_max > abs_max) K_max = abs_max;
+        K_max = (kMaxTileElems + CHUNK_SIZE - 1) / CHUNK_SIZE;
     }
     g_tcache.current_K_max = K_max;
     if (K_max > 1) {
@@ -824,6 +842,7 @@ MTensor msplat_render_edge_scores(
     auto edge_img_size = std::make_shared<std::array<uint32_t, 2>>(std::array<uint32_t, 2>{img_width, img_height});
     uint32_t num_points_u32 = (uint32_t)num_points;
     uint32_t num_tiles_u32 = (uint32_t)num_tiles;
+    uint32_t capacity_u32 = (uint32_t)capacity;
 
     auto encode_proj_sh = [&](id<MTLComputeCommandEncoder> enc) {
         NSUInteger tpg = MIN(ctx->project_and_sh_forward_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
@@ -875,7 +894,8 @@ MTensor msplat_render_edge_scores(
             ENC_BUF(enc, xys, 5); ENC_BUF(enc, conics, 6);
             ENC_BUF(enc, colors, 7); ENC_BUF(enc, opacities, 8);
             ENC_BUF(enc, packed_xy_opac, 9); ENC_BUF(enc, packed_conic, 10); ENC_BUF(enc, packed_rgb, 11);
-            ENC_BUF(enc, tile_bins, 12);
+            ENC_BUF(enc, tile_bins, 12); ENC_SCALAR(enc, capacity_u32, 13);
+            ENC_BUF(enc, g_tcache.overflow_flag, 14);
             [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
     };
@@ -953,22 +973,9 @@ std::tuple<MTensor, float> msplat_train_step(
     int tile_bounds_y = std::get<1>(tile_bounds);
     int num_tiles = tile_bounds_x * tile_bounds_y;
 
-    // --- Overflow check: detect per-tile overflow (> 4096 gaussians in a tile) ---
-    // Only warn once to avoid noisy output (per-tile overflow is common at >1M gaussians)
-    static bool overflow_warned = false;
     static int iter_count_oc = 0;
     iter_count_oc++;
-    bool num_points_changed = (num_points != g_tcache.fwd_num_points && g_tcache.fwd_num_points > 0);
-    if (!overflow_warned && g_tcache.overflow_flag.defined() && g_tcache.fwd_num_points > 0
-        && (num_points_changed || (iter_count_oc % 100) == 1)) {
-        ctx->syncCB();
-        int32_t flag_val = *g_tcache.overflow_flag.data<int32_t>();
-        if (flag_val > 0) {
-            fprintf(stderr, "WARNING: per-tile overflow (>4096 gaussians in a tile). "
-                    "Some gaussians were dropped from overfull tiles.\n");
-            overflow_warned = true;
-        }
-    }
+    maybe_warn_overflow(ctx, num_points, iter_count_oc);
     int64_t capacity = (int64_t)num_points * g_tcache.capacity_multiplier;
     uint32_t channels = 3;
 
@@ -1046,12 +1053,7 @@ std::tuple<MTensor, float> msplat_train_step(
     if (num_tiles >= 400) {
         K_max = 1;
     } else {
-        uint32_t avg_per_tile = (uint32_t)(capacity / std::max(1, num_tiles));
-        uint32_t conservative_max = avg_per_tile * 6;
-        K_max = (conservative_max + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        if (K_max < 2) K_max = 2;
-        uint32_t abs_max = (uint32_t)((capacity + CHUNK_SIZE - 1) / CHUNK_SIZE);
-        if (K_max > abs_max) K_max = abs_max;
+        K_max = (kMaxTileElems + CHUNK_SIZE - 1) / CHUNK_SIZE;
     }
     g_tcache.current_K_max = K_max;
     if (K_max > 1) {
@@ -1119,7 +1121,8 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, xys, 5); ENC_BUF(enc, conics, 6);
             ENC_BUF(enc, colors, 7); ENC_BUF(enc, opacities, 8);
             ENC_BUF(enc, packed_xy_opac, 9); ENC_BUF(enc, packed_conic, 10); ENC_BUF(enc, packed_rgb, 11);
-            ENC_BUF(enc, tile_bins, 12);
+            ENC_BUF(enc, tile_bins, 12); ENC_SCALAR(enc, capacity_u32, 13);
+            ENC_BUF(enc, g_tcache.overflow_flag, 14);
             [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
     };
@@ -1217,6 +1220,7 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, vis_counts, 14); ENC_BUF(enc, xys_grad_norm, 15);
             ENC_BUF(enc, v_xy, 16); ENC_BUF(enc, v_conic, 17);
             ENC_BUF(enc, v_colors_rast, 18); ENC_BUF(enc, v_opacity, 19);
+            ENC_BUF(enc, out_img, 20);
             [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
         } else {
             // Chunked backward
@@ -1250,6 +1254,7 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, v_xy, 19); ENC_BUF(enc, v_conic, 20);
             ENC_BUF(enc, v_colors_rast, 21); ENC_BUF(enc, v_opacity, 22);
             ENC_SCALAR(enc, BWD_CHUNK_SIZE, 23); ENC_SCALAR(enc, bwd_K_max, 24);
+            ENC_BUF(enc, out_img, 25);
             [enc dispatchThreadgroups:MTLSizeMake(tile_x, tile_y, bwd_K_max) threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
         }
     };
@@ -1506,6 +1511,8 @@ std::tuple<MTensor, float> msplat_train_step(
         });
     }
 
+    // Ensure GPU has finished writing loss_sum before CPU reads it
+    ctx->syncCB();
     float loss_val = *loss_sum.data<float>() / (float)(img_height * img_width);
     return std::make_tuple(radii_out, loss_val);
 }
@@ -1563,6 +1570,7 @@ int msplat_densify(
     uint32_t K = (uint32_t)((N + 1023) / 1024);  // threadgroups for prefix sum on N elements
     int check_screen_int = check_screen;
     int check_huge_int = check_huge;
+    NSUInteger prefix_tpg = MIN(ctx->prefix_sum_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)1024);
 
     id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
     assert(command_buffer && "Failed to retrieve command buffer reference");
@@ -1570,6 +1578,29 @@ int msplat_densify(
     dispatch_sync(ctx->d_queue, ^(){
         id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
         assert(enc && "Failed to create compute command encoder");
+
+        auto encode_block_prefix = [&](uint32_t count_u32, uint32_t num_blocks, MTensor &flags, MTensor &prefix) {
+            int block_totals_scanned = num_blocks <= 1024 ? 1 : 0;
+            [enc setComputePipelineState:ctx->block_reduce_kernel_cpso];
+            ENC_SCALAR(enc, count_u32, 0); ENC_BUF(enc, flags, 1);
+            ENC_BUF(enc, block_totals, 2);
+            [enc dispatchThreadgroups:MTLSizeMake(num_blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            if (block_totals_scanned != 0) {
+                // Scan block totals in place so propagate can read each block's inclusive prefix.
+                [enc setComputePipelineState:ctx->prefix_sum_kernel_cpso];
+                ENC_SCALAR(enc, num_blocks, 0); ENC_BUF(enc, block_totals, 1); ENC_BUF(enc, block_totals, 2);
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(prefix_tpg, 1, 1)];
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
+
+            [enc setComputePipelineState:ctx->block_scan_propagate_kernel_cpso];
+            ENC_SCALAR(enc, count_u32, 0); ENC_BUF(enc, flags, 1);
+            ENC_BUF(enc, prefix, 2); ENC_BUF(enc, block_totals, 3); ENC_SCALAR(enc, block_totals_scanned, 4);
+            [enc dispatchThreadgroups:MTLSizeMake(num_blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        };
 
         // ---- Stage 1: Classify (split/dup) ----
         {
@@ -1594,36 +1625,10 @@ int msplat_densify(
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
         // ---- Stage 2: Prefix sum on split_flag → split_prefix ----
-        {
-            [enc setComputePipelineState:ctx->block_reduce_kernel_cpso];
-            ENC_SCALAR(enc, N_u32, 0); ENC_BUF(enc, split_flag, 1);
-            ENC_BUF(enc, block_totals, 2);
-            [enc dispatchThreadgroups:MTLSizeMake(K, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        {
-            [enc setComputePipelineState:ctx->block_scan_propagate_kernel_cpso];
-            ENC_SCALAR(enc, N_u32, 0); ENC_BUF(enc, split_flag, 1);
-            ENC_BUF(enc, split_prefix, 2); ENC_BUF(enc, block_totals, 3);
-            [enc dispatchThreadgroups:MTLSizeMake(K, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        encode_block_prefix(N_u32, K, split_flag, split_prefix);
 
         // ---- Stage 3: Prefix sum on dup_flag → dup_prefix ----
-        {
-            [enc setComputePipelineState:ctx->block_reduce_kernel_cpso];
-            ENC_SCALAR(enc, N_u32, 0); ENC_BUF(enc, dup_flag, 1);
-            ENC_BUF(enc, block_totals, 2);
-            [enc dispatchThreadgroups:MTLSizeMake(K, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        {
-            [enc setComputePipelineState:ctx->block_scan_propagate_kernel_cpso];
-            ENC_SCALAR(enc, N_u32, 0); ENC_BUF(enc, dup_flag, 1);
-            ENC_BUF(enc, dup_prefix, 2); ENC_BUF(enc, block_totals, 3);
-            [enc dispatchThreadgroups:MTLSizeMake(K, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        encode_block_prefix(N_u32, K, dup_flag, dup_prefix);
 
         // ---- Stage 4: Append split children ----
         {
@@ -1718,21 +1723,8 @@ int msplat_densify(
         {
             uint32_t wc = (uint32_t)worst_case;
             uint32_t K2 = (uint32_t)((worst_case + 1023) / 1024);
-            [enc setComputePipelineState:ctx->block_reduce_kernel_cpso];
-            ENC_SCALAR(enc, wc, 0); ENC_BUF(enc, keep_flag, 1);
-            ENC_BUF(enc, block_totals, 2);
-            [enc dispatchThreadgroups:MTLSizeMake(K2, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+            encode_block_prefix(wc, K2, keep_flag, keep_prefix);
         }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        {
-            uint32_t wc = (uint32_t)worst_case;
-            uint32_t K2 = (uint32_t)((worst_case + 1023) / 1024);
-            [enc setComputePipelineState:ctx->block_scan_propagate_kernel_cpso];
-            ENC_SCALAR(enc, wc, 0); ENC_BUF(enc, keep_flag, 1);
-            ENC_BUF(enc, keep_prefix, 2); ENC_BUF(enc, block_totals, 3);
-            [enc dispatchThreadgroups:MTLSizeMake(K2, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
-        }
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
         // ---- Stage 8: Compact scatter (18 buffers → scratch) ----
         // For each buffer: scatter kept elements into compact_scratch
@@ -1870,6 +1862,35 @@ void msplat_hybrid_refine(
         ENC_BUF(enc, adam_exp_avg_sq_buf[4], 21);
         ENC_BUF(enc, adam_exp_avg_sq_buf[5], 22);
         [enc dispatchThreads:MTLSizeMake(budget, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+
+        [enc endEncoding];
+    });
+}
+
+void msplat_accumulate_refine_max(
+    int N,
+    MTensor &step_refine_score,
+    MTensor &refine_weight_max
+) {
+    if (N <= 0) return;
+
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    assert(command_buffer && "Failed to retrieve command buffer reference");
+
+    uint32_t n_u32 = (uint32_t)N;
+
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        assert(enc && "Failed to create compute command encoder");
+
+        NSUInteger tpg = MIN(ctx->accumulate_refine_max_kernel_cpso.maxTotalThreadsPerThreadgroup,
+                             (NSUInteger)N);
+        [enc setComputePipelineState:ctx->accumulate_refine_max_kernel_cpso];
+        ENC_SCALAR(enc, n_u32, 0);
+        ENC_BUF(enc, step_refine_score, 1);
+        ENC_BUF(enc, refine_weight_max, 2);
+        [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
 
         [enc endEncoding];
     });

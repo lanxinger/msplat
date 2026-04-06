@@ -21,8 +21,8 @@ struct Model{
         int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
         int refineEvery, int warmupLength, int resetAlphaEvery, float densifyGradThresh, float densifySizeThresh, int stopScreenSizeAt, float splitScreenSize,
         int maxSteps, bool keepCrs, float meanNoiseWeight, int noiseStopAt,
-        Strategy strategy = Strategy::Classic, int maxSplats = 1000000, float hybridGrowthFloorDivisor = 33.0f,
-        float growthGradThreshold = 0.003f, float growFraction = 0.07f, int growUntilIter = 15000,
+        Strategy strategy = Strategy::Classic, int maxSplats = 1000000, float hybridGrowthFloorDivisor = 0.0f,
+        float growthGradThreshold = 0.003f, float growFraction = 0.2f, int growUntilIter = 15000,
         float opacityDecay = 0.004f, float scaleDecay = 0.002f, float boundsPercentile = 0.8f,
         float scalesLrInit = 0.007f, float scalesLrFinal = 0.005f,
         const float* bgColor = nullptr);
