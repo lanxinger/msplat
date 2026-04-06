@@ -1,19 +1,20 @@
 import MsplatCore
 import Foundation
 
-nonisolated(unsafe) private var _metallibConfigured = false
-
-func ensureMetallibConfigured() {
-    guard !_metallibConfigured else { return }
-    _metallibConfigured = true
+private let configureMetallibOnce: Void = {
     #if os(iOS) || os(tvOS)
     let name = "default-ios"
     #else
     let name = "default-macos"
     #endif
+
     if let path = Bundle.module.path(forResource: name, ofType: "metallib") {
         msplat_set_metallib_path(path)
     }
+}()
+
+func ensureMetallibConfigured() {
+    _ = configureMetallibOnce
 }
 
 /// A loaded dataset of camera views for training.

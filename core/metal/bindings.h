@@ -111,6 +111,10 @@ int msplat_densify(
 // Must be called after msplat_render/msplat_gpu_sync and before the next render.
 void msplat_get_render_alpha(float* out, int n);
 
+// Convert the most recent render target to premultiplied RGBA8.
+// Caller must call msplat_gpu_sync() after rendering and before invoking this.
+void msplat_copy_last_render_rgba(uint8_t* outRGBA, int n, const float bg[3]);
+
 void msplat_hybrid_refine(
     int num_active, int budget, int fr_stride,
     MTensor &donor_indices, MTensor &random_samples,

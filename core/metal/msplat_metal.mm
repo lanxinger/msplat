@@ -1046,6 +1046,22 @@ void msplat_get_render_alpha(float* out, int n) {
     for (int i = 0; i < n; i++) out[i] = 1.0f - t[i];
 }
 
+void msplat_copy_last_render_rgba(uint8_t* outRGBA, int n, const float bg[3]) {
+    const float *rgb = g_tcache.out_img.data<float>();
+    const float *t = g_tcache.final_Ts.data<float>();
+    for (int i = 0; i < n; i++) {
+        float a = fminf(fmaxf(1.0f - t[i], 0.f), 1.f);
+        float one_minus_a = 1.0f - a;
+        float r = rgb[i * 3]     - one_minus_a * bg[0];
+        float g = rgb[i * 3 + 1] - one_minus_a * bg[1];
+        float b = rgb[i * 3 + 2] - one_minus_a * bg[2];
+        outRGBA[i * 4]     = (uint8_t)(fminf(fmaxf(r, 0.f), 1.f) * 255.f);
+        outRGBA[i * 4 + 1] = (uint8_t)(fminf(fmaxf(g, 0.f), 1.f) * 255.f);
+        outRGBA[i * 4 + 2] = (uint8_t)(fminf(fmaxf(b, 0.f), 1.f) * 255.f);
+        outRGBA[i * 4 + 3] = (uint8_t)(a * 255.f);
+    }
+}
+
 MTensor msplat_train_step(
     int num_points, MTensor &means3d, MTensor &scales, float glob_scale,
     MTensor &quats, MTensor &viewmat, MTensor &projmat,

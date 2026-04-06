@@ -15,7 +15,6 @@ public class GaussianTrainer {
 
     deinit {
         msplat_trainer_destroy(handle)
-        msplat_cleanup()
     }
 
     /// Run one training step.
@@ -57,8 +56,8 @@ public class GaussianTrainer {
         return PixelData(pixels: data, width: Int(buf.width), height: Int(buf.height))
     }
 
-    /// Zero-copy render from an arbitrary camera pose into a pre-allocated RGBA uint8 buffer.
-    /// For real-time display loops where allocation overhead matters.
+    /// Render from an arbitrary camera pose into a pre-allocated RGBA uint8 buffer.
+    /// Avoids allocating a float pixel array in the Swift wrapper.
     ///
     /// Pass `nil` for `rgba` to query dimensions without rendering (for buffer pre-allocation).
     /// Buffer must hold at least `width × height × 4` bytes.

@@ -316,26 +316,9 @@ void Trainer::renderFromPoseToBuffer(const float camToWorld[16], int refCameraIn
     *outHeight = h;
     if (!outRGBA) return;
 
-    // Read RGB + alpha from rasterizer transmittance (1 - T).
-    // The rasterizer composites: rgb_out = splat_rgb + T * bgColor.
-    // Unblend the background to recover premultiplied-alpha RGBA
-    // (CGImage premultipliedLast): premul = rgb_out - (1-a) * bg.
-    const float* src = (const float*)rgb.data_ptr();
     const float* bg = (const float*)impl->model->backgroundColor.data_ptr();
     int n = w * h;
-    std::vector<float> alpha(n);
-    msplat_get_render_alpha(alpha.data(), n);
-    for (int i = 0; i < n; i++) {
-        float a = fminf(fmaxf(alpha[i], 0.f), 1.f);
-        float one_minus_a = 1.0f - a;
-        float r = src[i*3]   - one_minus_a * bg[0];
-        float g = src[i*3+1] - one_minus_a * bg[1];
-        float b = src[i*3+2] - one_minus_a * bg[2];
-        outRGBA[i * 4]     = (uint8_t)(fminf(fmaxf(r, 0.f), 1.f) * 255.f);
-        outRGBA[i * 4 + 1] = (uint8_t)(fminf(fmaxf(g, 0.f), 1.f) * 255.f);
-        outRGBA[i * 4 + 2] = (uint8_t)(fminf(fmaxf(b, 0.f), 1.f) * 255.f);
-        outRGBA[i * 4 + 3] = (uint8_t)(a * 255.f);
-    }
+    msplat_copy_last_render_rgba(outRGBA, n, bg);
 }
 
 void Trainer::renderWithIntrinsicsToBuffer(const float camToWorld[16],
@@ -354,22 +337,9 @@ void Trainer::renderWithIntrinsicsToBuffer(const float camToWorld[16],
     *outWidth = w; *outHeight = h;
     if (!outRGBA) return;
 
-    const float* src = (const float*)rgb.data_ptr();
     const float* bg = (const float*)impl->model->backgroundColor.data_ptr();
     int n = w * h;
-    std::vector<float> alpha(n);
-    msplat_get_render_alpha(alpha.data(), n);
-    for (int i = 0; i < n; i++) {
-        float a = fminf(fmaxf(alpha[i], 0.f), 1.f);
-        float one_minus_a = 1.0f - a;
-        float r = src[i*3]   - one_minus_a * bg[0];
-        float g = src[i*3+1] - one_minus_a * bg[1];
-        float b = src[i*3+2] - one_minus_a * bg[2];
-        outRGBA[i * 4]     = (uint8_t)(fminf(fmaxf(r, 0.f), 1.f) * 255.f);
-        outRGBA[i * 4 + 1] = (uint8_t)(fminf(fmaxf(g, 0.f), 1.f) * 255.f);
-        outRGBA[i * 4 + 2] = (uint8_t)(fminf(fmaxf(b, 0.f), 1.f) * 255.f);
-        outRGBA[i * 4 + 3] = (uint8_t)(a * 255.f);
-    }
+    msplat_copy_last_render_rgba(outRGBA, n, bg);
 }
 
 void Trainer::renderWithFovToBuffer(const float camToWorld[16],
