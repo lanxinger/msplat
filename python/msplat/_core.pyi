@@ -31,6 +31,7 @@ class TrainingConfig:
     scales_lr_init: float
     scales_lr_final: float
     keep_crs: bool
+    mip_splatting: bool
     downscale_factor: float
     output: str
     save_every: int
@@ -53,6 +54,7 @@ class TrainingConfig:
         stop_screen_size_at: int = 4000,
         split_screen_size: float = 0.05,
         keep_crs: bool = False,
+        mip_splatting: bool = False,
         downscale_factor: float = 1.0,
         output: str = "splat.ply",
         save_every: int = -1,

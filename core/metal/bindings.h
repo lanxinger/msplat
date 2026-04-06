@@ -23,7 +23,8 @@ MTensor gpu_empty_private(std::vector<int64_t> shape, DType dtype);
 // Replaces generic pipelines with function-constant-specialized variants,
 // eliminating dead branches for SH degree and mask mode.
 // Safe to call multiple times — no-ops if config unchanged.
-void msplat_specialize_pipelines(unsigned degrees_to_use, bool has_mask);
+void msplat_specialize_pipelines(unsigned degrees_to_use, bool has_mask, bool mip_splatting);
+void msplat_set_mip_splatting(bool enabled);
 
 // Commit current command buffer (non-blocking)
 void msplat_commit();

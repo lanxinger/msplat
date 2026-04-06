@@ -63,6 +63,7 @@ struct TrainingConfig {
     float scales_lr_init = 0.007f;
     float scales_lr_final = 0.005f;
     bool keep_crs = false;
+    bool mip_splatting = false;
     float downscale_factor = 1.0f;
     std::string output = "splat.ply";
     int save_every = -1;
@@ -147,6 +148,7 @@ public:
             cfg.densify_grad_thresh, cfg.densify_size_thresh,
             cfg.stop_screen_size_at, cfg.split_screen_size,
             cfg.iterations, cfg.keep_crs, cfg.mean_noise_weight, cfg.noise_stop_at,
+            cfg.mip_splatting,
             parse_strategy_name(cfg.strategy), cfg.max_splats, cfg.hybrid_growth_floor_divisor,
             cfg.growth_grad_threshold, cfg.grow_fraction, cfg.grow_until_iter,
             cfg.opacity_decay, cfg.scale_decay, cfg.bounds_percentile,
@@ -330,7 +332,7 @@ NB_MODULE(_core, m) {
                 int refine_every, int warmup_length, int reset_alpha_every,
                 float densify_grad_thresh, float densify_size_thresh,
                 int stop_screen_size_at, float split_screen_size,
-                bool keep_crs, float downscale_factor,
+                bool keep_crs, bool mip_splatting, float downscale_factor,
                 const std::string &output, int save_every,
                 std::vector<float> bg_color,
                 float mean_noise_weight, int noise_stop_at,
@@ -353,6 +355,7 @@ NB_MODULE(_core, m) {
             cfg->stop_screen_size_at = stop_screen_size_at;
             cfg->split_screen_size = split_screen_size;
             cfg->keep_crs = keep_crs;
+            cfg->mip_splatting = mip_splatting;
             cfg->downscale_factor = downscale_factor;
             cfg->output = output;
             cfg->save_every = save_every;
@@ -388,6 +391,7 @@ NB_MODULE(_core, m) {
             "stop_screen_size_at"_a = 4000,
             "split_screen_size"_a = 0.05f,
             "keep_crs"_a = false,
+            "mip_splatting"_a = false,
             "downscale_factor"_a = 1.0f,
             "output"_a = "splat.ply",
             "save_every"_a = -1,
@@ -432,6 +436,7 @@ NB_MODULE(_core, m) {
         .def_rw("scales_lr_init", &TrainingConfig::scales_lr_init)
         .def_rw("scales_lr_final", &TrainingConfig::scales_lr_final)
         .def_rw("keep_crs", &TrainingConfig::keep_crs)
+        .def_rw("mip_splatting", &TrainingConfig::mip_splatting)
         .def_rw("downscale_factor", &TrainingConfig::downscale_factor)
         .def_rw("output", &TrainingConfig::output)
         .def_rw("save_every", &TrainingConfig::save_every)

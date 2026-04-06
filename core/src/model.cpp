@@ -917,6 +917,7 @@ Model::Model(const InputData &inputData, int numCameras,
     int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
     int refineEvery, int warmupLength, int resetAlphaEvery, float densifyGradThresh, float densifySizeThresh, int stopScreenSizeAt, float splitScreenSize,
     int maxSteps, bool keepCrs, float meanNoiseWeight, int noiseStopAt,
+    bool mipSplatting,
     Strategy strategy, int maxSplats, float hybridGrowthFloorDivisor,
     float growthGradThreshold, float growFraction, int growUntilIter,
     float opacityDecay, float scaleDecay, float boundsPercentile,
@@ -927,7 +928,7 @@ Model::Model(const InputData &inputData, int numCameras,
       refineEvery(refineEvery), warmupLength(warmupLength), resetAlphaEvery(resetAlphaEvery),
       stopSplitAt(maxSteps / 2), densifyGradThresh(densifyGradThresh), densifySizeThresh(densifySizeThresh),
       stopScreenSizeAt(stopScreenSizeAt), splitScreenSize(splitScreenSize),
-      maxSteps(maxSteps), keepCrs(keepCrs), meanNoiseWeight(meanNoiseWeight), noiseStopAt(noiseStopAt),
+      maxSteps(maxSteps), keepCrs(keepCrs), mipSplatting(mipSplatting), meanNoiseWeight(meanNoiseWeight), noiseStopAt(noiseStopAt),
       strategy(strategy), hybridRefine(strategyUsesHybridRefine(strategy)), maxSplats(maxSplats),
       hybridGrowthFloorDivisor(hybridGrowthFloorDivisor),
       growthGradThreshold(growthGradThreshold), growFraction(growFraction), growUntilIter(growUntilIter),
@@ -949,6 +950,9 @@ Model::Model(const InputData &inputData, int numCameras,
         if (this->maxSplats <= 0) this->maxSplats = 4000000;
         this->stopSplitAt = std::min(this->maxSteps, 15000);
     }
+
+    // Set mip-splatting mode (affects pipeline specialization)
+    msplat_set_mip_splatting(mipSplatting);
 
     int64_t numPoints = inputData.points.count;
     scale = inputData.scale;
@@ -1040,7 +1044,7 @@ void Model::setupOptimizers(){
             lr_init[1] = 7e-3f;
             lr_init[2] = 2e-3f;
             lr_init[3] = 2e-3f;
-            lr_init[4] = 2e-3f;
+            lr_init[4] = 2e-3f / 20.0f;  // SH rest: DC / 20 (matches Brush)
             lr_init[5] = 0.012f;
             break;
         case Strategy::MRNF:
@@ -1048,7 +1052,7 @@ void Model::setupOptimizers(){
             lr_init[1] = 7e-3f;
             lr_init[2] = 2e-3f;
             lr_init[3] = 2e-3f;
-            lr_init[4] = 2e-3f;
+            lr_init[4] = 2e-3f / 20.0f;  // SH rest: DC / 20 (matches Brush)
             lr_init[5] = 0.012f;
             break;
         case Strategy::IGSPlus:
@@ -1056,7 +1060,7 @@ void Model::setupOptimizers(){
             lr_init[1] = 2e-2f;
             lr_init[2] = 1.5e-3f;
             lr_init[3] = 5e-3f;
-            lr_init[4] = 5e-3f;
+            lr_init[4] = 5e-3f / 20.0f;  // SH rest: DC / 20 (matches Brush)
             lr_init[5] = 0.025f;
             break;
     }
@@ -1704,6 +1708,11 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight, 
     lastHeight = s.height; lastWidth = s.width;
     int numPoints = means.size(0);
 
+    // Final 10% of training: switch to pure L1 for tighter per-pixel accuracy (matches Brush aux_loss_time=0.9)
+    constexpr float auxLossTime = 0.9f;
+    if (maxSteps > 0 && step > (int)(auxLossTime * maxSteps))
+        ssimWeight = 0.0f;
+
     // Initialize SSIM window (once)
     if (!window2d.defined()) {
         auto w = createSSIMWindow(11, 1.5f);
@@ -1736,6 +1745,18 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight, 
     float invMaxDim = 1.0f / static_cast<float>((std::max)(lastHeight, lastWidth));
     float lossInvN = 1.0f / (float)(s.height * s.width * 3);
     int densificationMode = strategy == Strategy::Hybrid ? 2 : (strategyUsesHybridRefine(strategy) ? 1 : 0);
+
+    // Background noise: add per-step random perturbation to prevent splats from
+    // relying on a fixed background color (matches Brush background_noise_strength=0.1).
+    constexpr float bgNoiseStrength = 0.1f;
+    float *bgPtr = backgroundColor.data<float>();
+    float bgOrig[3] = {bgPtr[0], bgPtr[1], bgPtr[2]};
+    {
+        std::mt19937 rng(step ^ 0xB601u);
+        std::uniform_real_distribution<float> dist(-bgNoiseStrength, bgNoiseStrength);
+        for (int c = 0; c < 3; c++)
+            bgPtr[c] = std::clamp(bgPtr[c] + dist(rng), 0.0f, 1.0f);
+    }
     MTensor trainBackground = backgroundColor;
 
     MTensor r = msplat_train_step(
@@ -1750,6 +1771,9 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight, 
         adam_ss, adam_bc2s,
         adam_beta1, adam_beta2, adam_eps,
         visCounts, xysGradNorm, max2DSize, invMaxDim, densificationMode, mask);
+
+    // Restore original background color after noisy training step
+    bgPtr[0] = bgOrig[0]; bgPtr[1] = bgOrig[1]; bgPtr[2] = bgOrig[2];
 
     radii = r;
     applyMeanNoise(step);

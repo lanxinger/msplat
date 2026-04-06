@@ -89,6 +89,8 @@ int main(int argc, char *argv[]) {
     app.add_option("--split-screen-size", splitScreenSize, "Screen-space split threshold");
     bool keepCrs = false;
     app.add_flag("--keep-crs", keepCrs, "Retain input coordinate reference system");
+    bool mipSplatting = false;
+    app.add_flag("--mip-splatting", mipSplatting, "Enable mip-splatting (smaller blur + opacity compensation)");
     float meanNoiseWeight = 50.0f;
     app.add_option("--mean-noise-weight", meanNoiseWeight, "Brush-style mean noise weight during growth")
         ->check(CLI::Range(0.0f, 1000000.0f));
@@ -217,6 +219,7 @@ int main(int argc, char *argv[]) {
                      refineEvery, warmupLength, resetAlphaEvery, densifyGradThresh,
                      densifySizeThresh, stopScreenSizeAt, splitScreenSize,
                      numIters, keepCrs, meanNoiseWeight, noiseStopAt,
+                     mipSplatting,
                      strategy, maxSplats, hybridGrowthFloorDivisor,
                      growthGradThreshold, growFraction, growUntilIter,
                      opacityDecay, scaleDecay, boundsPercentile,

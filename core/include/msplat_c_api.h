@@ -41,6 +41,7 @@ typedef struct {
     float scalesLrInit;
     float scalesLrFinal;
     bool keepCrs;
+    bool mipSplatting;
     float downscaleFactor;
     float bgColor[3];
 } MsplatConfig;
@@ -74,6 +75,7 @@ static inline MsplatConfig msplat_default_config(void) {
     c.scalesLrInit = 0.007f;
     c.scalesLrFinal = 0.005f;
     c.keepCrs = false;
+    c.mipSplatting = false;
     c.downscaleFactor = 1.0f;
     c.bgColor[0] = 0.0f; c.bgColor[1] = 0.0f; c.bgColor[2] = 0.0f;
     return c;

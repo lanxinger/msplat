@@ -41,6 +41,7 @@ struct Config {
     float scalesLrInit = 0.007f;
     float scalesLrFinal = 0.005f;
     bool keepCrs = false;
+    bool mipSplatting = false;  // Mip-splatting: smaller blur (0.1) with opacity compensation
     float downscaleFactor = 1.0f;
     float bgColor[3] = {0.0f, 0.0f, 0.0f};  // black — matches Brush default for masked training
 };

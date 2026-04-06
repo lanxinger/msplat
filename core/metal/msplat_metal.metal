@@ -11,6 +11,27 @@ using namespace metal;
 #define CHANNELS 3
 #define MAX_REGISTER_CHANNELS 3
 
+// Mip-splatting mode: smaller blur with opacity compensation (preserves integrated contribution).
+// Default mode: larger blur, no compensation (simpler, sufficient for most scenes).
+constant bool fc_mip_splatting   [[function_constant(2)]];
+constant float COV_BLUR = fc_mip_splatting ? 0.1f : 0.3f;
+
+// Compute the opacity compensation factor from a conic (inverse of blurred cov2d).
+// Returns sqrt(det_raw / det_blurred) so that opacity * comp preserves the
+// Gaussian's integrated contribution despite the blur.  Returns 1.0 when
+// mip-splatting is disabled (compiled away by the function-constant branch).
+inline float cov_compensation(float3 conic) {
+    if (!fc_mip_splatting) return 1.0f;
+    float det_conic = conic.x * conic.z - conic.y * conic.y; // = 1/det_blur
+    if (det_conic <= 0.0f) return 1.0f;
+    float inv_det = 1.0f / det_conic;                        // = det_blur
+    float a_raw = conic.z * inv_det - COV_BLUR;              // cov2d.x (unblurred)
+    float c_raw = conic.x * inv_det - COV_BLUR;              // cov2d.z (unblurred)
+    float b     = -conic.y * inv_det;                         // cov2d.y (unchanged)
+    float det_raw = a_raw * c_raw - b * b;
+    return sqrt(max(0.0f, det_raw * det_conic));              // sqrt(det_raw / det_blur)
+}
+
 constant float SH_C0 = 0.28209479177387814f;
 constant float SH_C1 = 0.4886025119029199f;
 constant float SH_C2[] = {
@@ -446,6 +467,9 @@ kernel void project_gaussians_forward_kernel(
     float3 cov2d = project_cov3d_ewa(
         cur_cov3d, viewmat, fx, fy, tan_fovx, tan_fovy, p_view
     );
+    // Anti-aliasing: low-pass filter on 2D covariance
+    cov2d.x += COV_BLUR;
+    cov2d.z += COV_BLUR;
 
     float3 conic;
     float radius;
@@ -512,6 +536,7 @@ kernel void nd_rasterize_forward_kernel(
     threadgroup float3 xy_opacity_batch[RAST_BLOCK_SIZE];
     threadgroup float3 conic_batch[RAST_BLOCK_SIZE];
     threadgroup float3 rgbs_batch[RAST_BLOCK_SIZE];
+    threadgroup float comp_batch[RAST_BLOCK_SIZE];
 
     float T = 1.f;
     float3 pix_out = {0.f, 0.f, 0.f};
@@ -529,6 +554,7 @@ kernel void nd_rasterize_forward_kernel(
             // Sequential reads from packed sorted-order buffers
             xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
             conic_batch[tr] = read_packed_float3(packed_conic, idx);
+            comp_batch[tr] = cov_compensation(conic_batch[tr]);
             // packed_rgb has raw SH output — clamp_min(raw + 0.5, 0)
             const float3 raw_c = read_packed_float3(packed_rgb, idx);
             rgbs_batch[tr] = max(raw_c + 0.5f, 0.0f);
@@ -558,7 +584,7 @@ kernel void nd_rasterize_forward_kernel(
                 continue;
             }
 
-            const float alpha = min(0.999f, xy_opac.z * exp(-sigma));
+            const float alpha = min(0.999f, xy_opac.z * comp_batch[t] * exp(-sigma));
             if (alpha < 1.f / 255.f) {
                 continue;
             }
@@ -617,6 +643,7 @@ kernel void rasterize_edge_scores_kernel(
     threadgroup int32_t id_batch[RAST_BLOCK_SIZE];
     threadgroup float3 xy_opacity_batch[RAST_BLOCK_SIZE];
     threadgroup float3 conic_batch[RAST_BLOCK_SIZE];
+    threadgroup float comp_batch[RAST_BLOCK_SIZE];
 
     const float px = (float)j;
     const float py = (float)i;
@@ -632,6 +659,7 @@ kernel void rasterize_edge_scores_kernel(
             id_batch[tr] = gaussian_ids_sorted[idx];
             xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
             conic_batch[tr] = read_packed_float3(packed_conic, idx);
+            comp_batch[tr] = cov_compensation(conic_batch[tr]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -650,7 +678,7 @@ kernel void rasterize_edge_scores_kernel(
                 continue;
             }
 
-            const float alpha = min(0.999f, xy_opac.z * exp(-sigma));
+            const float alpha = min(0.999f, xy_opac.z * comp_batch[t] * exp(-sigma));
             if (alpha < 1.f / 255.f) {
                 continue;
             }
@@ -1038,6 +1066,7 @@ kernel void rasterize_backward_kernel(
     threadgroup float3 xy_opacity_batch[RAST_BLOCK_SIZE];
     threadgroup float3 conic_batch[RAST_BLOCK_SIZE];
     threadgroup float3 rgbs_batch[RAST_BLOCK_SIZE];
+    threadgroup float comp_batch[RAST_BLOCK_SIZE];
 
     // df/d_out for this pixel — apply derivative of forward saturate() clamp:
     // zero gradient for channels clamped at 1.0 (overbright)
@@ -1082,6 +1111,7 @@ kernel void rasterize_backward_kernel(
             // Sequential reads from packed sorted-order buffers
             xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
             conic_batch[tr] = read_packed_float3(packed_conic, idx);
+            comp_batch[tr] = cov_compensation(conic_batch[tr]);
             rgbs_batch[tr] = read_packed_float3(packed_rgb, idx);
         }
         // wait for other threads to collect the gaussians in batch
@@ -1095,16 +1125,19 @@ kernel void rasterize_backward_kernel(
             // simd_broadcast replaces 32 redundant threadgroup reads.
             float3 b_conic = 0, b_xy_opac = 0, b_rgb = 0;
             int32_t b_id = 0;
+            float b_comp = 1.0f;
             if (wr == 0) {
                 b_conic = conic_batch[t];
                 b_xy_opac = xy_opacity_batch[t];
                 b_rgb = rgbs_batch[t];
                 b_id = id_batch[t];
+                b_comp = comp_batch[t];
             }
             b_conic = simd_broadcast(b_conic, 0);
             b_xy_opac = simd_broadcast(b_xy_opac, 0);
             b_rgb = simd_broadcast(b_rgb, 0);
             b_id = simd_broadcast(b_id, 0);
+            b_comp = simd_broadcast(b_comp, 0);
 
             int valid = inside;
             if (batch_end - t > bin_final) {
@@ -1124,7 +1157,7 @@ kernel void rasterize_backward_kernel(
                     valid = 0;
                 } else {
                     vis = exp(-sigma);
-                    alpha = min(0.999f, opac * vis);
+                    alpha = min(0.999f, opac * b_comp * vis);
                     if (alpha < 1.f / 255.f) {
                         valid = 0;
                     }
@@ -1950,6 +1983,9 @@ kernel void project_and_sh_forward_kernel(
     float3 cov2d = project_cov3d_ewa(
         local_cov3d, viewmat, fx, fy, tan_fovx, tan_fovy, p_view
     );
+    // Anti-aliasing: low-pass filter on 2D covariance
+    cov2d.x += COV_BLUR;
+    cov2d.z += COV_BLUR;
 
     float3 conic;
     float radius;
@@ -2906,6 +2942,7 @@ kernel void rasterize_forward_chunked_kernel(
     threadgroup float3 xy_opacity_batch[RAST_BLOCK_SIZE];
     threadgroup float3 conic_batch[RAST_BLOCK_SIZE];
     threadgroup float3 rgbs_batch[RAST_BLOCK_SIZE];
+    threadgroup float comp_batch[RAST_BLOCK_SIZE];
 
     float T = 1.f;
     float3 pix_out = {0.f, 0.f, 0.f};
@@ -2919,6 +2956,7 @@ kernel void rasterize_forward_chunked_kernel(
         if (idx < chunk_end) {
             xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
             conic_batch[tr] = read_packed_float3(packed_conic, idx);
+            comp_batch[tr] = cov_compensation(conic_batch[tr]);
             const float3 raw_c = read_packed_float3(packed_rgb, idx);
             rgbs_batch[tr] = max(raw_c + 0.5f, 0.0f);
         }
@@ -2935,7 +2973,7 @@ kernel void rasterize_forward_chunked_kernel(
                 fma(conic_local.x, delta.x * delta.x, conic_local.z * delta.y * delta.y),
                 conic_local.y * delta.x * delta.y);
             if (sigma < 0.f || sigma >= 5.55f) continue;
-            const float alpha = min(0.999f, xy_opac.z * exp(-sigma));
+            const float alpha = min(0.999f, xy_opac.z * comp_batch[t] * exp(-sigma));
             if (alpha < 1.f / 255.f) continue;
             const float next_T = T * (1.f - alpha);
             if (next_T <= 1e-4f) {
@@ -3144,6 +3182,7 @@ kernel void rasterize_backward_chunked_kernel(
     threadgroup float3 xy_opacity_batch[RAST_BLOCK_SIZE];
     threadgroup float3 conic_batch[RAST_BLOCK_SIZE];
     threadgroup float3 rgbs_batch[RAST_BLOCK_SIZE];
+    threadgroup float comp_batch[RAST_BLOCK_SIZE];
 
     // Warp-level early exit
     const int warp_bin_final = warp_reduce_all_max(bin_final, warp_size);
@@ -3171,6 +3210,7 @@ kernel void rasterize_backward_chunked_kernel(
             id_batch[tr] = gaussian_ids_sorted[idx];
             xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
             conic_batch[tr] = read_packed_float3(packed_conic, idx);
+            comp_batch[tr] = cov_compensation(conic_batch[tr]);
             rgbs_batch[tr] = read_packed_float3(packed_rgb, idx);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3178,16 +3218,19 @@ kernel void rasterize_backward_chunked_kernel(
         for (int t = max(0, batch_end - warp_bin_final); t < batch_size; ++t) {
             float3 b_conic = 0, b_xy_opac = 0, b_rgb = 0;
             int32_t b_id = 0;
+            float b_comp = 1.0f;
             if (wr == 0) {
                 b_conic = conic_batch[t];
                 b_xy_opac = xy_opacity_batch[t];
                 b_rgb = rgbs_batch[t];
                 b_id = id_batch[t];
+                b_comp = comp_batch[t];
             }
             b_conic = simd_broadcast(b_conic, 0);
             b_xy_opac = simd_broadcast(b_xy_opac, 0);
             b_rgb = simd_broadcast(b_rgb, 0);
             b_id = simd_broadcast(b_id, 0);
+            b_comp = simd_broadcast(b_comp, 0);
 
             int valid = inside;
             if (batch_end - t > bin_final) valid = 0;
@@ -3206,7 +3249,7 @@ kernel void rasterize_backward_chunked_kernel(
                     valid = 0;
                 } else {
                     vis = exp(-sigma);
-                    alpha = min(0.999f, opac * vis);
+                    alpha = min(0.999f, opac * b_comp * vis);
                     if (alpha < 1.f / 255.f) valid = 0;
                 }
             }

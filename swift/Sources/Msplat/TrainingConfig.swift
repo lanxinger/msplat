@@ -29,6 +29,7 @@ public struct TrainingConfig {
     public var scalesLrInit: Float = 0.007
     public var scalesLrFinal: Float = 0.005
     public var keepCrs: Bool = false
+    public var mipSplatting: Bool = false
     public var downscaleFactor: Float = 1.0
     /// Background color as (R, G, B) in [0, 1]. Default black, matching Brush-style masked training.
     public var bgColor: (Float, Float, Float) = (0.0, 0.0, 0.0)
@@ -64,6 +65,7 @@ public struct TrainingConfig {
         c.scalesLrInit = scalesLrInit
         c.scalesLrFinal = scalesLrFinal
         c.keepCrs = keepCrs
+        c.mipSplatting = mipSplatting
         c.downscaleFactor = downscaleFactor
         c.bgColor = (bgColor.0, bgColor.1, bgColor.2)
         return c

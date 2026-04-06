@@ -148,6 +148,7 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
         config.densifyGradThresh, config.densifySizeThresh,
         config.stopScreenSizeAt, config.splitScreenSize,
         config.iterations, config.keepCrs, config.meanNoiseWeight, config.noiseStopAt,
+        config.mipSplatting,
         strategyFromInt(config.strategy), config.maxSplats, config.hybridGrowthFloorDivisor,
         config.growthGradThreshold, config.growFraction, config.growUntilIter,
         config.opacityDecay, config.scaleDecay, config.boundsPercentile,
@@ -449,6 +450,7 @@ static msplat::Config configFromC(MsplatConfig c) {
     cfg.scalesLrInit = c.scalesLrInit;
     cfg.scalesLrFinal = c.scalesLrFinal;
     cfg.keepCrs = c.keepCrs;
+    cfg.mipSplatting = c.mipSplatting;
     cfg.downscaleFactor = c.downscaleFactor;
     memcpy(cfg.bgColor, c.bgColor, sizeof(cfg.bgColor));
     return cfg;

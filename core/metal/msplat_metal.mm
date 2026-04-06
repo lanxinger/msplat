@@ -174,6 +174,7 @@ struct MetalContext {
     id<MTLLibrary> metal_library;
     uint specialized_degrees_to_use = UINT_MAX;  // sentinel: not yet specialized
     bool specialized_has_mask = false;
+    bool specialized_mip_splatting = false;
 };
 
 // Explicit metallib path (set by Swift/Python wrappers before first use)
@@ -275,8 +276,10 @@ MetalContext* init_msplat_metal_context() {
     MTLFunctionConstantValues *init_fcv = [MTLFunctionConstantValues new];
     uint init_dtu = 0;
     bool init_hm  = false;
+    bool init_mip = false;
     [init_fcv setConstantValue:&init_dtu type:MTLDataTypeUInt atIndex:0];
     [init_fcv setConstantValue:&init_hm  type:MTLDataTypeBool atIndex:1];
+    [init_fcv setConstantValue:&init_mip type:MTLDataTypeBool atIndex:2];
 
     auto load_fc = [&](NSString* name) -> id<MTLComputePipelineState> {
         return load_specialized(ctx->device, metal_library, name, init_fcv);
@@ -284,8 +287,8 @@ MetalContext* init_msplat_metal_context() {
 
     // Forward pipeline (function-constant kernels use load_fc)
     ctx->project_and_sh_forward_kernel_cpso       = load_fc(@"project_and_sh_forward_kernel");
-    ctx->nd_rasterize_forward_kernel_cpso         = load(@"nd_rasterize_forward_kernel");
-    ctx->rasterize_edge_scores_kernel_cpso        = load(@"rasterize_edge_scores_kernel");
+    ctx->nd_rasterize_forward_kernel_cpso         = load_fc(@"nd_rasterize_forward_kernel");
+    ctx->rasterize_edge_scores_kernel_cpso        = load_fc(@"rasterize_edge_scores_kernel");
     // Tile-local sorting
     ctx->scatter_to_prealloc_bins_kernel_cpso      = load(@"scatter_to_prealloc_bins_kernel");
     ctx->bitonic_sort_per_tile_kernel_cpso        = load(@"bitonic_sort_per_tile_kernel");
@@ -294,11 +297,11 @@ MetalContext* init_msplat_metal_context() {
     ctx->block_reduce_kernel_cpso                 = load(@"block_reduce_kernel");
     ctx->block_scan_propagate_kernel_cpso         = load(@"block_scan_propagate_kernel");
     // Depth-chunked rasterization
-    ctx->rasterize_forward_chunked_kernel_cpso    = load(@"rasterize_forward_chunked_kernel");
+    ctx->rasterize_forward_chunked_kernel_cpso    = load_fc(@"rasterize_forward_chunked_kernel");
     ctx->rasterize_forward_merge_kernel_cpso      = load(@"rasterize_forward_merge_kernel");
     ctx->compute_chunk_prefix_suffix_kernel_cpso  = load(@"compute_chunk_prefix_suffix_kernel");
-    ctx->rasterize_backward_chunked_kernel_cpso   = load(@"rasterize_backward_chunked_kernel");
-    ctx->rasterize_backward_kernel_cpso           = load(@"rasterize_backward_kernel");
+    ctx->rasterize_backward_chunked_kernel_cpso   = load_fc(@"rasterize_backward_chunked_kernel");
+    ctx->rasterize_backward_kernel_cpso           = load_fc(@"rasterize_backward_kernel");
     // Separable SSIM loss
     ctx->ssim_h_fwd_kernel_cpso                   = load(@"ssim_h_fwd_kernel");
     ctx->ssim_v_fwd_kernel_cpso                   = load(@"ssim_v_fwd_kernel");
@@ -345,48 +348,55 @@ MetalContext* get_global_context() {
     return ctx;
 }
 
-void msplat_specialize_pipelines(unsigned degrees_to_use, bool has_mask) {
+void msplat_specialize_pipelines(unsigned degrees_to_use, bool has_mask, bool mip_splatting) {
     MetalContext* ctx = get_global_context();
 
     if (ctx->specialized_degrees_to_use == degrees_to_use &&
-        ctx->specialized_has_mask == has_mask) {
+        ctx->specialized_has_mask == has_mask &&
+        ctx->specialized_mip_splatting == mip_splatting) {
         return;  // already specialized for this config
     }
 
     MTLFunctionConstantValues *fcv = [MTLFunctionConstantValues new];
     uint fc_dtu = degrees_to_use;
     bool fc_hm  = has_mask;
+    bool fc_mip = mip_splatting;
     [fcv setConstantValue:&fc_dtu type:MTLDataTypeUInt atIndex:0];
     [fcv setConstantValue:&fc_hm  type:MTLDataTypeBool atIndex:1];
+    [fcv setConstantValue:&fc_mip type:MTLDataTypeBool atIndex:2];
 
-    // Re-create only the PSOs whose kernels reference function constants.
-    auto old_fwd = ctx->project_and_sh_forward_kernel_cpso;
-    ctx->project_and_sh_forward_kernel_cpso =
-        load_specialized(ctx->device, ctx->metal_library, @"project_and_sh_forward_kernel", fcv);
-    [old_fwd release];
+    auto respec = [&](id<MTLComputePipelineState>& pso, NSString* name) {
+        auto old = pso;
+        pso = load_specialized(ctx->device, ctx->metal_library, name, fcv);
+        [old release];
+    };
 
-    auto old_bwd = ctx->project_and_sh_backward_kernel_cpso;
-    ctx->project_and_sh_backward_kernel_cpso =
-        load_specialized(ctx->device, ctx->metal_library, @"project_and_sh_backward_kernel", fcv);
-    [old_bwd release];
-
-    auto old_ssim_fused = ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso;
-    ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso =
-        load_specialized(ctx->device, ctx->metal_library, @"ssim_fused_v_fwd_h_bwd_kernel", fcv);
-    [old_ssim_fused release];
-
-    auto old_ssim_vbwd = ctx->ssim_v_bwd_kernel_cpso;
-    ctx->ssim_v_bwd_kernel_cpso =
-        load_specialized(ctx->device, ctx->metal_library, @"ssim_v_bwd_kernel", fcv);
-    [old_ssim_vbwd release];
+    // Re-create all PSOs whose kernels reference function constants.
+    respec(ctx->project_and_sh_forward_kernel_cpso,  @"project_and_sh_forward_kernel");
+    respec(ctx->project_and_sh_backward_kernel_cpso, @"project_and_sh_backward_kernel");
+    respec(ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso,  @"ssim_fused_v_fwd_h_bwd_kernel");
+    respec(ctx->ssim_v_bwd_kernel_cpso,              @"ssim_v_bwd_kernel");
+    // Rasterizer kernels (COV_BLUR + compensation depend on fc_mip_splatting)
+    respec(ctx->nd_rasterize_forward_kernel_cpso,    @"nd_rasterize_forward_kernel");
+    respec(ctx->rasterize_edge_scores_kernel_cpso,   @"rasterize_edge_scores_kernel");
+    respec(ctx->rasterize_forward_chunked_kernel_cpso, @"rasterize_forward_chunked_kernel");
+    respec(ctx->rasterize_backward_kernel_cpso,      @"rasterize_backward_kernel");
+    respec(ctx->rasterize_backward_chunked_kernel_cpso, @"rasterize_backward_chunked_kernel");
 
     [fcv release];
 
     ctx->specialized_degrees_to_use = degrees_to_use;
     ctx->specialized_has_mask = has_mask;
+    ctx->specialized_mip_splatting = mip_splatting;
 
-    fprintf(stderr, "msplat: specialized pipelines (sh_degree=%u, has_mask=%d)\n",
-            degrees_to_use, has_mask);
+    fprintf(stderr, "msplat: specialized pipelines (sh_degree=%u, has_mask=%d, mip=%d)\n",
+            degrees_to_use, has_mask, mip_splatting);
+}
+
+void msplat_set_mip_splatting(bool enabled) {
+    get_global_context()->specialized_mip_splatting = enabled;
+    // Force re-specialization on next specialize call
+    get_global_context()->specialized_degrees_to_use = UINT_MAX;
 }
 
 #define ENC_SCALAR(encoder, x, i) [encoder setBytes:&x length:sizeof(x) atIndex:i]
@@ -877,7 +887,7 @@ MTensor msplat_render(
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background
 ) {
-    msplat_specialize_pipelines(degrees_to_use, false);
+    msplat_specialize_pipelines(degrees_to_use, false, get_global_context()->specialized_mip_splatting);
     MTensor dummyGt, dummyWindow;
     forward_pipeline(num_points, means3d, scales, glob_scale,
         quats, viewmat, projmat, fx, fy, cx, cy,
@@ -897,7 +907,7 @@ MTensor msplat_render_edge_scores(
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &edge_map
 ) {
-    msplat_specialize_pipelines(degrees_to_use, false);
+    msplat_specialize_pipelines(degrees_to_use, false, get_global_context()->specialized_mip_splatting);
     MetalContext* ctx = get_global_context();
     int tile_bounds_x = std::get<0>(tile_bounds);
     int tile_bounds_y = std::get<1>(tile_bounds);
@@ -1060,7 +1070,7 @@ MTensor msplat_train_step(
 
     // Specialize pipelines for current SH degree / mask config (no-ops if unchanged)
     bool has_mask_flag = mask && mask->defined();
-    msplat_specialize_pipelines(degrees_to_use, has_mask_flag);
+    msplat_specialize_pipelines(degrees_to_use, has_mask_flag, ctx->specialized_mip_splatting);
 
     int tile_bounds_x = std::get<0>(tile_bounds);
     int tile_bounds_y = std::get<1>(tile_bounds);

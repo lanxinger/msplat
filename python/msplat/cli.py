@@ -67,6 +67,9 @@ def main():
         keep_crs: bool = False
         """Keep input coordinate reference system"""
 
+        mip_splatting: bool = False
+        """Enable mip-splatting (smaller blur + opacity compensation)"""
+
         save_every: int = -1
         """Save every N steps (-1 to disable)"""
 
@@ -95,6 +98,7 @@ def main():
         stop_screen_size_at=args.stop_screen_size_at,
         split_screen_size=args.split_screen_size,
         keep_crs=args.keep_crs,
+        mip_splatting=args.mip_splatting,
         downscale_factor=args.downscale_factor,
         output=args.output,
         save_every=args.save_every,
