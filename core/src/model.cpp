@@ -366,9 +366,9 @@ void afterTrainClassicOrHybrid(Model &model, int step) {
                 model.ensureCapacity(model.num_active + budget);
                 fr_stride = (int)model.featuresRest_buf.stride0();
                 op = model.opacities_buf.data<float>();
-
-                std::vector<int32_t> donorIdx(budget);
-                std::vector<uint8_t> chosen(model.num_active, 0);
+                int32_t *donorIdx = model.donorIndexScratch.data<int32_t>();
+                auto &chosen = model.donorChosenScratch;
+                chosen.assign(model.num_active, 0);
                 int selected = 0;
 
                 auto sample_donors = [&](const std::vector<double> &weights, uint32_t seed, int count) {
@@ -392,7 +392,8 @@ void afterTrainClassicOrHybrid(Model &model, int step) {
                 };
 
                 if (replacement > 0) {
-                    std::vector<double> replaceWeights(model.num_active, 0.0);
+                    auto &replaceWeights = model.donorWeightScratchA;
+                    replaceWeights.assign(model.num_active, 0.0);
                     for (int i = 0; i < model.num_active; ++i) {
                         if (compactVis[i] <= 0.0f) continue;
                         replaceWeights[i] = sigmoidf(op[i]);
@@ -401,7 +402,8 @@ void afterTrainClassicOrHybrid(Model &model, int step) {
                 }
 
                 if (growth > 0) {
-                    std::vector<double> growthWeights(model.num_active, 0.0);
+                    auto &growthWeights = model.donorWeightScratchB;
+                    growthWeights.assign(model.num_active, 0.0);
                     for (int i = 0; i < model.num_active; ++i) {
                         if (chosen[i] || compactVis[i] <= 0.0f || compactGrad[i] <= model.growthGradThreshold)
                             continue;
@@ -411,8 +413,7 @@ void afterTrainClassicOrHybrid(Model &model, int step) {
                 }
 
                 if (selected > 0) {
-                    MTensor donorBuf = gpu_empty({(int64_t)selected}, DType::Int32);
-                    memcpy(donorBuf.data_ptr(), donorIdx.data(), selected * sizeof(int32_t));
+                    MTensor donorBuf = model.donorIndexScratch.view(selected);
                     msplat_hybrid_refine(
                         model.num_active, selected, fr_stride,
                         donorBuf, static_cast<uint32_t>(step ^ 0xC001D00Du),
@@ -1091,6 +1092,7 @@ void Model::setupOptimizers(){
     int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
     densify_compact_scratch = gpu_empty_private({(int64_t)buf_capacity * fr_stride}, DType::Float32);
     densify_keep_count_readback = gpu_empty({1}, DType::Int32);
+    donorIndexScratch = gpu_empty({buf_capacity}, DType::Int32);
     refineWeightMax = gpu_zeros({buf_capacity}, DType::Float32);
     errorScoreMax = gpu_zeros({buf_capacity}, DType::Float32);
     igsInitialPoints = num_active;
@@ -1112,6 +1114,7 @@ void Model::releaseOptimizers(){
     densify_keep_flag.reset(); densify_keep_prefix.reset();
     densify_keep_count_readback.reset();
     densify_block_totals.reset(); densify_compact_scratch.reset();
+    donorIndexScratch.reset();
     refineWeightMax.reset();
     errorScoreMax.reset();
 }
@@ -1179,6 +1182,7 @@ void Model::ensureCapacity(int needed){
     int64_t fr_stride = featuresRest_buf.stride0();
     densify_compact_scratch = gpu_empty_private({(int64_t)new_cap * fr_stride}, DType::Float32);
     densify_keep_count_readback = gpu_empty({1}, DType::Int32);
+    donorIndexScratch = gpu_empty({new_cap}, DType::Int32);
     {
         MTensor new_refine = gpu_zeros({new_cap}, DType::Float32);
         if (refineWeightMax.defined())
@@ -1625,6 +1629,7 @@ int Model::loadCheckpoint(const std::string &filename) {
     int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
     densify_compact_scratch = gpu_empty_private({(int64_t)buf_capacity * fr_stride}, DType::Float32);
     densify_keep_count_readback = gpu_empty({1}, DType::Int32);
+    donorIndexScratch = gpu_empty({buf_capacity}, DType::Int32);
     refineWeightMax = gpu_zeros({buf_capacity}, DType::Float32);
     errorScoreMax = gpu_zeros({buf_capacity}, DType::Float32);
     if (strategy != Strategy::IGSPlus || igsInitialPoints <= 0) igsInitialPoints = num_active;

@@ -90,6 +90,10 @@ struct Model{
   MTensor densify_keep_count_readback;
   MTensor densify_block_totals;
   MTensor densify_compact_scratch;
+  MTensor donorIndexScratch;
+  std::vector<uint8_t> donorChosenScratch;
+  std::vector<double> donorWeightScratchA;
+  std::vector<double> donorWeightScratchB;
 
   MTensor radii;
   int lastHeight;
