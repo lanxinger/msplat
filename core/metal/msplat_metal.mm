@@ -1163,12 +1163,15 @@ MTensor msplat_train_step(
     MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
     float inv_max_dim,
     int densification_mode,
-    MTensor *mask
+    int alpha_mode,
+    float match_alpha_weight,
+    MTensor *mask,
+    MTensor *alpha_target
 ) {
     MetalContext* ctx = get_global_context();
 
     // Specialize pipelines for current SH degree / mask config (no-ops if unchanged)
-    bool has_mask_flag = mask && mask->defined();
+    bool has_mask_flag = alpha_mode == 0 && mask && mask->defined();
     msplat_specialize_pipelines(degrees_to_use, has_mask_flag, ctx->specialized_mip_splatting);
 
     int tile_bounds_x = std::get<0>(tile_bounds);
@@ -1222,10 +1225,12 @@ MTensor msplat_train_step(
         std::array<MTensor, 6>{v_mean3d, v_scale, v_quat, v_features_dc, v_features_rest, v_opacity});
 
     // --- Mask setup ---
-    int has_mask_val = (mask && mask->defined()) ? 1 : 0;
+    int has_mask_val = (alpha_mode == 0 && mask && mask->defined()) ? 1 : 0;
     if (!has_mask_val && !g_tcache.dummy_mask.defined())
         g_tcache.dummy_mask = gpu_empty({1}, DType::Float32);
     MTensor mask_buf = has_mask_val ? *mask : g_tcache.dummy_mask;
+    int has_alpha_target = (alpha_target && alpha_target->defined()) ? 1 : 0;
+    MTensor alpha_target_buf = has_alpha_target ? *alpha_target : g_tcache.dummy_mask;
 
     // --- Constants ---
     std::array<uint32_t, 2> loss_img_size = {img_width, img_height};
@@ -1401,7 +1406,11 @@ MTensor msplat_train_step(
         ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
         ENC_BUF(enc, v_rendered, 6);
         ENC_BUF(enc, mask_buf, 7); ENC_SCALAR(enc, has_mask_val, 8);
-        ENC_BUF(enc, v_alpha_img, 9);
+        ENC_BUF(enc, final_Ts, 9);
+        ENC_BUF(enc, v_alpha_img, 10);
+        ENC_BUF(enc, alpha_target_buf, 11);
+        ENC_SCALAR(enc, has_alpha_target, 12);
+        ENC_SCALAR(enc, match_alpha_weight, 13);
         [enc dispatchThreads:grid threadsPerThreadgroup:tg];
     };
 

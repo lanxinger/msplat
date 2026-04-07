@@ -1921,7 +1921,7 @@ kernel void apply_mean_noise_kernel(
 
     float alpha = 1.0f / (1.0f + exp(-opacities[idx]));
     float inv_alpha = clamp(1.0f - alpha, 0.0f, 1.0f);
-    float exponent = mrnf_mode ? 150.0f : 32.0f;
+    float exponent = 150.0f;
     float noise_scale = pow(inv_alpha, exponent) * lr_mean * mean_noise_weight;
     if (noise_scale <= 0.0f) return;
 
@@ -3764,9 +3764,13 @@ kernel void ssim_v_bwd_kernel(
     constant float& ssim_weight,
     constant float& inv_n,          // 1.0 / (H * W * 3)
     device float* v_rendered,       // (H, W, 3)
-    device float* v_alpha_img,      // (H, W)
+    constant float* final_Ts [[buffer(9)]],       // (H, W)
+    device float* v_alpha_img [[buffer(10)]],      // (H, W)
     constant float* mask [[buffer(7)]],
     constant int& has_mask [[buffer(8)]],
+    constant float* alpha_target [[buffer(11)]],
+    constant int& has_alpha_target [[buffer(12)]],
+    constant float& match_alpha_weight [[buffer(13)]],
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -3836,6 +3840,13 @@ kernel void ssim_v_bwd_kernel(
                 }
             } else {
                 grad += inv_n * (1.0f - ssim_weight) * v_l1;
+                if (c == 0 && has_alpha_target) {
+                    float target = alpha_target[py * W + px];
+                    float pred_alpha = 1.0f - final_Ts[py * W + px];
+                    float v_alpha_l1 =
+                        (pred_alpha > target) ? 1.0f : ((pred_alpha < target) ? -1.0f : 0.0f);
+                    alpha_grad = 3.0f * inv_n * match_alpha_weight * v_alpha_l1;
+                }
             }
             v_rendered[(py * W + px) * 3 + c] = grad;
         }

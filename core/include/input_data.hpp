@@ -57,8 +57,8 @@ struct Camera {
         int roiX = 0, roiY = 0, roiW = 0, roiH = 0;
     } reload_;
 
-    void loadImage(float downscaleFactor, const std::string &maskDir = "");
-    void loadMetadataOnly(float downscaleFactor, const std::string &maskDir = "");
+    void loadImage(float downscaleFactor, const std::string &maskDir = "", int maxResolution = 0);
+    void loadMetadataOnly(float downscaleFactor, const std::string &maskDir = "", int maxResolution = 0);
     void reloadImage();
     void reloadMask();
     Image getImage(int downscaleFactor);

@@ -40,10 +40,12 @@ struct Config {
     float boundsPercentile = 0.8f;
     float scalesLrInit = 0.007f;
     float scalesLrFinal = 0.005f;
+    int alphaMode = 1;  // 0=masked, 1=transparent
+    float matchAlphaWeight = 0.1f;
     bool keepCrs = false;
     bool mipSplatting = false;  // Mip-splatting: smaller blur (0.1) with opacity compensation
     float downscaleFactor = 1.0f;
-    float bgColor[3] = {0.0f, 0.0f, 0.0f};  // black — matches Brush default for masked training
+    float bgColor[3] = {0.0f, 0.0f, 0.0f};  // black — matches Brush single-object training defaults
 };
 
 // ── Stats ───────────────────────────────────────────────────────────────────
@@ -93,7 +95,7 @@ struct PixelBuffer {
 class Dataset {
 public:
     Dataset(const std::string& path, float downscaleFactor,
-            bool evalMode, int testEvery, int maxCameras = 0);
+            bool evalMode, int testEvery, int maxCameras = 0, int maxResolution = 0);
     ~Dataset();
 
     Dataset(const Dataset&) = delete;

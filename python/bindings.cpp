@@ -88,14 +88,14 @@ public:
     std::vector<Camera> test_cams;
 
     Dataset(const std::string &path, float downscale_factor,
-            bool eval_mode, int test_every)
+            bool eval_mode, int test_every, int max_resolution)
     {
         data = inputDataFromX(path);
 
         // Metadata-only init: compute intrinsics/undistortion geometry without pixel decode.
         // Pixels are loaded lazily on first GPU access per training step.
         for (auto &cam : data.cameras) {
-            cam.loadMetadataOnly(downscale_factor);
+            cam.loadMetadataOnly(downscale_factor, "", max_resolution);
         }
 
         if (eval_mode) {
@@ -460,9 +460,10 @@ NB_MODULE(_core, m) {
     // Dataset
     nb::class_<Dataset>(m, "Dataset",
             "A loaded dataset of camera images. Auto-detects COLMAP, Nerfstudio, and Polycam formats.")
-        .def(nb::init<const std::string &, float, bool, int>(),
+        .def(nb::init<const std::string &, float, bool, int, int>(),
             "path"_a, "downscale_factor"_a = 1.0f,
-            "eval_mode"_a = false, "test_every"_a = 8)
+            "eval_mode"_a = false, "test_every"_a = 8,
+            "max_resolution"_a = 0)
         .def_prop_ro("num_train", &Dataset::num_train, "Number of training cameras.")
         .def_prop_ro("num_test", &Dataset::num_test, "Number of test cameras (0 unless eval_mode=True).")
         .def("camera_pose", &Dataset::camera_pose, "index"_a,

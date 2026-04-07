@@ -86,7 +86,10 @@ MTensor msplat_train_step(
     MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
     float inv_max_dim,
     int densification_mode,
-    MTensor *mask = nullptr
+    int alpha_mode,
+    float match_alpha_weight,
+    MTensor *mask = nullptr,
+    MTensor *alpha_target = nullptr
 );
 
 int msplat_densify(

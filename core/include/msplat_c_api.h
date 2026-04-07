@@ -40,6 +40,8 @@ typedef struct {
     float boundsPercentile;
     float scalesLrInit;
     float scalesLrFinal;
+    int alphaMode;
+    float matchAlphaWeight;
     bool keepCrs;
     bool mipSplatting;
     float downscaleFactor;
@@ -74,6 +76,8 @@ static inline MsplatConfig msplat_default_config(void) {
     c.boundsPercentile = 0.8f;
     c.scalesLrInit = 0.007f;
     c.scalesLrFinal = 0.005f;
+    c.alphaMode = 1;
+    c.matchAlphaWeight = 0.1f;
     c.keepCrs = false;
     c.mipSplatting = false;
     c.downscaleFactor = 1.0f;
@@ -112,6 +116,9 @@ typedef void* MsplatDataset;
 MsplatDataset msplat_dataset_create(const char* path, float downscaleFactor,
                                      bool evalMode, int testEvery,
                                      int maxCameras);
+MsplatDataset msplat_dataset_create_ex(const char* path, float downscaleFactor,
+                                       int maxResolution, bool evalMode,
+                                       int testEvery, int maxCameras);
 void msplat_dataset_destroy(MsplatDataset ds);
 int msplat_dataset_num_train(MsplatDataset ds);
 int msplat_dataset_num_test(MsplatDataset ds);

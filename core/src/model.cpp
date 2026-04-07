@@ -184,13 +184,18 @@ std::vector<float> computePerSplatEdgeScores(Model &model, std::vector<Camera> &
 
 void schedulersStepClassicOrHybrid(Model &model, int step) {
     float t = std::clamp((float)step / (float)model.maxSteps, 0.f, 1.f);
-    model.adam_lr[0] = std::exp(std::log(model.means_lr_init) * (1.f - t)
-                              + std::log(model.means_lr_final) * t);
+    model.meansLrUnscaled = std::exp(std::log(model.means_lr_init) * (1.f - t)
+                                   + std::log(model.means_lr_final) * t);
+    if (model.strategy == Strategy::Hybrid)
+        model.adam_lr[0] = model.meansLrUnscaled * (model.boundsValid ? model.bounds.medianSize : 1.0f);
+    else
+        model.adam_lr[0] = model.meansLrUnscaled;
 }
 
 void afterTrainClassicOrHybrid(Model &model, int step) {
     if (!model.radii.defined()) return;
     const bool refineStep = step % model.refineEvery == 0 && step > model.warmupLength;
+    const bool allowHybridRefine = model.maxSteps <= 0 || ((float)step / (float)model.maxSteps) <= 0.95f;
     if (model.strategy == Strategy::Hybrid && model.xysGradNorm.defined() && model.refineWeightMax.defined()) {
         msplat_accumulate_refine_max(model.num_active, model.xysGradNorm, model.refineWeightMax);
     }
@@ -244,7 +249,7 @@ void afterTrainClassicOrHybrid(Model &model, int step) {
         }
     }
 
-    if (model.hybridRefine && refineStep) {
+    if (model.hybridRefine && refineStep && allowHybridRefine) {
         msplat_gpu_sync();
         static constexpr float MIN_OPACITY = 1.0f / 255.0f;
         float train_t = std::clamp((float)step / (float)model.maxSteps, 0.0f, 1.0f);
@@ -900,6 +905,22 @@ float l1_loss(const MTensor& rendered, const MTensor& gt, const MTensor* mask) {
     return (float)(wsum_err / wsum);
 }
 
+MTensor compositeGtOnBackground(const MTensor& gt, const MTensor& alpha, const float bg[3]) {
+    MTensor composited = gpu_empty(gt.shape(), DType::Float32);
+    const float *g = gt.data<float>();
+    const float *a = alpha.data<float>();
+    float *out = composited.data<float>();
+    int64_t pixels = gt.numel() / 3;
+    for (int64_t p = 0; p < pixels; ++p) {
+        float alphaVal = a[p];
+        float invAlpha = 1.0f - alphaVal;
+        out[p*3+0] = g[p*3+0] * alphaVal + bg[0] * invAlpha;
+        out[p*3+1] = g[p*3+1] * alphaVal + bg[1] * invAlpha;
+        out[p*3+2] = g[p*3+2] * alphaVal + bg[2] * invAlpha;
+    }
+    return composited;
+}
+
 // Model constructor
 Model::Model(const InputData &inputData, int numCameras,
     int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
@@ -910,6 +931,7 @@ Model::Model(const InputData &inputData, int numCameras,
     float growthGradThreshold, float growFraction, int growUntilIter,
     float opacityDecay, float scaleDecay, float boundsPercentile,
     float scalesLrInit, float scalesLrFinal,
+    AlphaMode alphaMode, float matchAlphaWeight,
     const float* bgColor)
     : numCameras(numCameras), numDownscales(numDownscales), resolutionSchedule(resolutionSchedule),
       shDegree(shDegree), shDegreeInterval(shDegreeInterval),
@@ -921,6 +943,7 @@ Model::Model(const InputData &inputData, int numCameras,
       hybridGrowthFloorDivisor(hybridGrowthFloorDivisor),
       growthGradThreshold(growthGradThreshold), growFraction(growFraction), growUntilIter(growUntilIter),
       opacityDecay(opacityDecay), scaleDecay(scaleDecay), boundsPercentile(boundsPercentile),
+      alphaMode(alphaMode), matchAlphaWeight(matchAlphaWeight),
       scaleLrCurrent(scalesLrInit),
       scaleLrGamma((scalesLrInit > 0.0f && scalesLrFinal > 0.0f)
             ? std::pow((double)scalesLrFinal / (double)scalesLrInit, 1.0 / std::max(1, maxSteps))
@@ -1010,6 +1033,10 @@ Model::Model(const InputData &inputData, int numCameras,
     static const float defaultBg[3] = {0.0f, 0.0f, 0.0f};
     memcpy(backgroundColor.data_ptr(), bgColor ? bgColor : defaultBg, 3 * sizeof(float));
     setupOptimizers();
+    if (strategy == Strategy::Hybrid) {
+        computeBounds();
+        adam_lr[0] = meansLrUnscaled * (boundsValid ? bounds.medianSize : 1.0f);
+    }
 }
 
 void Model::setupOptimizers(){
@@ -1226,6 +1253,7 @@ void Model::afterTrain(std::vector<Camera>& cameras, int step){
 }
 
 void Model::applyMaskOpacityPenalty(std::vector<Camera>& cameras, int step) {
+    if (alphaMode != AlphaMode::Masked) return;
     if (!maskAwareData || num_active <= 0) return;
     // Only run every refineEvery steps during training
     if (step % refineEvery != 0 || step <= warmupLength) return;
@@ -1682,7 +1710,10 @@ Model::CamSetup Model::prepareCam(Camera& cam, int step) {
         cam.cachedFovX = fovX; cam.cachedFovY = fovY;
     }
 
-    s.degreesToUse = (std::min<int>)(step / shDegreeInterval, shDegree);
+    if (strategy == Strategy::Hybrid)
+        s.degreesToUse = shDegree;
+    else
+        s.degreesToUse = (std::min<int>)(step / shDegreeInterval, shDegree);
     int b = featuresRest.size(-2) + 1;
     s.degree = (b <= 1) ? 0 : (b <= 4) ? 1 : (b <= 9) ? 2 : (b <= 16) ? 3 : 4;
     s.tileBounds = std::make_tuple(
@@ -1764,19 +1795,33 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight, 
             bgPtr[c] = std::clamp(bgPtr[c] + dist(rng), 0.0f, 1.0f);
     }
     MTensor trainBackground = backgroundColor;
+    MTensor composedGt;
+    MTensor *maskForLoss = (alphaMode == AlphaMode::Masked) ? mask : nullptr;
+    MTensor *alphaTarget = nullptr;
+    MTensor *trainGt = &gt;
+    if (mask && mask->defined() && alphaMode == AlphaMode::Transparent) {
+        alphaTarget = mask;
+        composedGt = compositeGtOnBackground(gt, *mask, bgPtr);
+        trainGt = &composedGt;
+    }
 
     MTensor r = msplat_train_step(
         numPoints, means, scales, 1.0f,
         quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
         s.height, s.width, s.tileBounds, 0.01f,
         s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
-        opacities, trainBackground, gt, window2d, ssimWeight,
+        opacities, trainBackground, *trainGt, window2d, ssimWeight,
         lossInvN, (int)featuresRest.size(-2),
         N_ADAM_GROUPS,
         adam_p, adam_ea, adam_eas,
         adam_ss, adam_bc2s,
         adam_beta1, adam_beta2, adam_eps,
-        visCounts, xysGradNorm, max2DSize, invMaxDim, densificationMode, mask);
+        visCounts, xysGradNorm, max2DSize, invMaxDim, densificationMode,
+        alphaMode == AlphaMode::Masked ? 0 : 1,
+        matchAlphaWeight,
+        maskForLoss,
+        alphaTarget
+    );
 
     // Restore original background color after noisy training step
     bgPtr[0] = bgOrig[0]; bgPtr[1] = bgOrig[1]; bgPtr[2] = bgOrig[2];

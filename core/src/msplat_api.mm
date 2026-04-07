@@ -31,6 +31,14 @@ static Strategy strategyFromInt(int value) {
     }
 }
 
+static AlphaMode alphaModeFromInt(int value) {
+    switch (value) {
+        case 0: return AlphaMode::Masked;
+        case 1: return AlphaMode::Transparent;
+        default: throw std::invalid_argument("Invalid alpha mode: " + std::to_string(value));
+    }
+}
+
 // ── Dataset::Impl ───────────────────────────────────────────────────────────
 
 struct Dataset::Impl {
@@ -40,7 +48,7 @@ struct Dataset::Impl {
 };
 
 Dataset::Dataset(const std::string& path, float downscaleFactor,
-                 bool evalMode, int testEvery, int maxCameras)
+                 bool evalMode, int testEvery, int maxCameras, int maxResolution)
     : impl(std::make_unique<Impl>())
 {
     impl->data = inputDataFromX(path);
@@ -61,7 +69,7 @@ Dataset::Dataset(const std::string& path, float downscaleFactor,
     size_t total = impl->data.cameras.size();
     if (total <= 1) {
         for (auto& cam : impl->data.cameras)
-            cam.loadImage(downscaleFactor);
+            cam.loadImage(downscaleFactor, "", maxResolution);
     } else {
         std::atomic<bool> loadFailed{false};
         std::atomic<bool> *loadFailedPtr = &loadFailed;
@@ -71,12 +79,13 @@ Dataset::Dataset(const std::string& path, float downscaleFactor,
         std::mutex *loadErrMutexPtr = &loadErrMutex;
         Camera *cams = impl->data.cameras.data();
         float dsf = downscaleFactor;
+        int maxRes = maxResolution;
 
         dispatch_apply(total, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
             ^(size_t i) {
                 if (loadFailedPtr->load(std::memory_order_relaxed)) return;
                 try {
-                    cams[i].loadImage(dsf);
+                    cams[i].loadImage(dsf, "", maxRes);
                 } catch (...) {
                     loadFailedPtr->store(true, std::memory_order_relaxed);
                     std::lock_guard<std::mutex> lock(*loadErrMutexPtr);
@@ -153,6 +162,7 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
         config.growthGradThreshold, config.growFraction, config.growUntilIter,
         config.opacityDecay, config.scaleDecay, config.boundsPercentile,
         config.scalesLrInit, config.scalesLrFinal,
+        alphaModeFromInt(config.alphaMode), config.matchAlphaWeight,
         config.bgColor
     );
 
@@ -421,6 +431,8 @@ static msplat::Config configFromC(MsplatConfig c) {
     cfg.boundsPercentile = c.boundsPercentile;
     cfg.scalesLrInit = c.scalesLrInit;
     cfg.scalesLrFinal = c.scalesLrFinal;
+    cfg.alphaMode = c.alphaMode;
+    cfg.matchAlphaWeight = c.matchAlphaWeight;
     cfg.keepCrs = c.keepCrs;
     cfg.mipSplatting = c.mipSplatting;
     cfg.downscaleFactor = c.downscaleFactor;
@@ -431,7 +443,15 @@ static msplat::Config configFromC(MsplatConfig c) {
 MsplatDataset msplat_dataset_create(const char* path, float downscaleFactor,
                                      bool evalMode, int testEvery,
                                      int maxCameras) {
-    auto* ds = new msplat::Dataset(std::string(path), downscaleFactor, evalMode, testEvery, maxCameras);
+    auto* ds = new msplat::Dataset(std::string(path), downscaleFactor, evalMode, testEvery, maxCameras, 0);
+    return static_cast<MsplatDataset>(ds);
+}
+
+MsplatDataset msplat_dataset_create_ex(const char* path, float downscaleFactor,
+                                       int maxResolution, bool evalMode,
+                                       int testEvery, int maxCameras) {
+    auto* ds = new msplat::Dataset(std::string(path), downscaleFactor, evalMode,
+                                   testEvery, maxCameras, maxResolution);
     return static_cast<MsplatDataset>(ds);
 }
 

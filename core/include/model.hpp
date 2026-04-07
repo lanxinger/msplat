@@ -16,6 +16,11 @@ enum class Strategy {
   IGSPlus = 3,
 };
 
+enum class AlphaMode {
+  Masked = 0,
+  Transparent = 1,
+};
+
 struct Model{
   Model(const InputData &inputData, int numCameras,
         int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
@@ -26,6 +31,7 @@ struct Model{
         float growthGradThreshold = 0.003f, float growFraction = 0.2f, int growUntilIter = 15000,
         float opacityDecay = 0.004f, float scaleDecay = 0.002f, float boundsPercentile = 0.8f,
         float scalesLrInit = 0.007f, float scalesLrFinal = 0.005f,
+        AlphaMode alphaMode = AlphaMode::Transparent, float matchAlphaWeight = 0.1f,
         const float* bgColor = nullptr);
 
   ~Model(){ releaseOptimizers(); }
@@ -136,6 +142,8 @@ struct Model{
   float opacityDecay;
   float scaleDecay;
   float boundsPercentile;
+  AlphaMode alphaMode;
+  float matchAlphaWeight;
   SceneBounds bounds;
   bool boundsValid = false;
   int refineWindowsSinceBounds = 0;

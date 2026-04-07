@@ -38,6 +38,9 @@ int main(int argc, char *argv[]) {
     std::string resume;
     app.add_option("--resume", resume, "Resume training from PLY file")
         ->check(CLI::ExistingFile);
+    bool resumeAssumeComplete = false;
+    app.add_flag("--resume-assume-complete", resumeAssumeComplete,
+        "If the resumed PLY has no saved step, assume training is complete and skip the train loop");
 
     // Validation
     bool validate = false;
@@ -50,6 +53,9 @@ int main(int argc, char *argv[]) {
     // Evaluation
     bool evalMode = false;
     app.add_flag("--eval", evalMode, "Evaluate on held-out test views");
+    bool reportBrushMetrics = false;
+    app.add_flag("--report-brush-metrics", reportBrushMetrics,
+        "Also report Brush-style eval metrics (GT composited on black, full-image PSNR/SSIM)");
     int testEvery = 8;
     app.add_option("--test-every", testEvery, "Hold out every Nth image for eval")
         ->check(CLI::Range(2, 100));
@@ -61,6 +67,10 @@ int main(int argc, char *argv[]) {
     float downScaleFactor = 1.0f;
     app.add_option("-d,--downscale-factor", downScaleFactor, "Image downscale factor")
         ->check(CLI::Range(1.0f, 32.0f));
+    int maxResolution = 0;
+    app.add_option("--max-resolution", maxResolution,
+                   "Cap the loaded image long edge before training/eval (0 = uncapped)")
+        ->check(CLI::Range(0, 1000000));
     int numDownscales = 2;
     app.add_option("--num-downscales", numDownscales, "Progressive downscale levels");
     int resolutionSchedule = 3000;
@@ -73,6 +83,13 @@ int main(int argc, char *argv[]) {
     float ssimWeight = 0.2f;
     app.add_option("--ssim-weight", ssimWeight, "SSIM loss weight (0 = L1 only)")
         ->check(CLI::Range(0.0f, 1.0f));
+    std::string alphaModeName = "transparent";
+    app.add_option("--alpha-mode", alphaModeName, "Alpha handling for masked data: masked or transparent")
+        ->check(CLI::IsMember({"masked", "transparent"}));
+    float matchAlphaWeight = 0.1f;
+    app.add_option("--match-alpha-weight", matchAlphaWeight,
+                   "Transparent alpha-mode weight for alpha matching loss")
+        ->check(CLI::Range(0.0f, 1000000.0f));
     int refineEvery = 200;
     app.add_option("--refine-every", refineEvery, "Densify/prune every N steps");
     int warmupLength = 0;
@@ -149,7 +166,13 @@ int main(int argc, char *argv[]) {
         if (name == "igsplus") return Strategy::IGSPlus;
         throw std::runtime_error("Invalid strategy: " + name);
     };
+    auto parseAlphaMode = [](const std::string &name) {
+        if (name == "masked") return AlphaMode::Masked;
+        if (name == "transparent") return AlphaMode::Transparent;
+        throw std::runtime_error("Invalid alpha mode: " + name);
+    };
     Strategy strategy = parseStrategy(strategyName);
+    AlphaMode alphaMode = parseAlphaMode(alphaModeName);
 
     if (validate || !valRender.empty()) validate = true;
     if (!valRender.empty() && !fs::exists(valRender)) fs::create_directories(valRender);
@@ -170,10 +193,11 @@ int main(int argc, char *argv[]) {
             Camera *cams = inputData.cameras.data();
             float dsf = downScaleFactor;
             std::string md = maskDir;
+            int maxRes = maxResolution;
             dispatch_apply(total, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
                 ^(size_t i) {
                     try {
-                        cams[i].loadMetadataOnly(dsf, md);
+                        cams[i].loadMetadataOnly(dsf, md, maxRes);
                     } catch (...) {
                         *errPtr = std::current_exception();
                         return;
@@ -224,6 +248,7 @@ int main(int argc, char *argv[]) {
                      growthGradThreshold, growFraction, growUntilIter,
                      opacityDecay, scaleDecay, boundsPercentile,
                      scalesLrInit, scalesLrFinal,
+                     alphaMode, matchAlphaWeight,
                      bgColor.data());
         std::cout << " done" << std::endl;
 
@@ -232,7 +257,21 @@ int main(int argc, char *argv[]) {
         InfiniteRandomIterator<size_t> camsIter(camIndices);
 
         size_t step = 1;
-        if (!resume.empty()) step = model.loadPly(resume) + 1;
+        if (!resume.empty()) {
+            int loadedStep = model.loadPly(resume);
+            if (loadedStep > 0) {
+                step = (size_t)(loadedStep + 1);
+            } else if (resumeAssumeComplete) {
+                std::cerr << "Resume file does not encode a training step; "
+                          << "assuming it is fully trained because --resume-assume-complete was set."
+                          << std::endl;
+                step = (size_t)(numIters + 1);
+            } else {
+                throw std::runtime_error(
+                    "Resume file does not encode a training step. "
+                    "Use --resume-assume-complete to treat it as a finished checkpoint.");
+            }
+        }
 
         bool benchmarking = std::getenv("BENCHMARK") != nullptr;
         int bench_warmup = 50;
@@ -385,6 +424,8 @@ int main(int argc, char *argv[]) {
         // Evaluation
         if (evalMode && !testCams.empty()) {
             double sumPsnr = 0, sumSsim = 0, sumL1 = 0;
+            double sumBrushPsnr = 0, sumBrushSsim = 0;
+            int nBrush = 0;
             int nTest = testCams.size();
 
             std::cout << "\n=== Evaluation (" << nTest << " test views) ===" << std::endl;
@@ -406,14 +447,46 @@ int main(int argc, char *argv[]) {
                 float l = l1_loss(rgb_cpu, gt_cpu, maskEval);
                 sumPsnr += p; sumSsim += s; sumL1 += l;
 
+                float p_brush = p;
+                float s_brush = s;
+                if (reportBrushMetrics && maskEval && mask_cpu.defined()) {
+                    // Match Brush eval: GT composited on black, then measure
+                    // full-image RGB error against a black-background render.
+                    MTensor gtComp = gpu_empty(gt_cpu.shape(), DType::Float32);
+                    const float *g = gt_cpu.data<float>();
+                    const float *m = mask_cpu.data<float>();
+                    float *gc = gtComp.data<float>();
+                    int64_t pixels = gt_cpu.numel() / 3;
+                    for (int64_t q = 0; q < pixels; q++) {
+                        gc[q*3+0] = g[q*3+0] * m[q];
+                        gc[q*3+1] = g[q*3+1] * m[q];
+                        gc[q*3+2] = g[q*3+2] * m[q];
+                    }
+                    p_brush = psnr(rgb_cpu, gtComp, nullptr);
+                    s_brush = ssim_eval(rgb_cpu, gtComp, 11, 1.5f, nullptr);
+                    sumBrushPsnr += p_brush;
+                    sumBrushSsim += s_brush;
+                    nBrush++;
+                }
+
                 std::cout << "  [" << (i+1) << "/" << nTest << "] "
                           << fs::path(testCams[i].filePath).filename().string()
-                          << "  PSNR=" << p << "  SSIM=" << s << "  L1=" << l << std::endl;
+                          << "  PSNR=" << p << "  SSIM=" << s << "  L1=" << l;
+                if (reportBrushMetrics && maskEval && mask_cpu.defined()) {
+                    std::cout << "  [brush-style PSNR=" << p_brush
+                              << " SSIM=" << s_brush << "]";
+                }
+                std::cout << std::endl;
             }
             std::cout << "\n  PSNR:  " << (sumPsnr / nTest)
                       << "  SSIM:  " << (sumSsim / nTest)
                       << "  L1:  " << (sumL1 / nTest)
-                      << "  Gaussians: " << model.means.size(0) << std::endl;
+                      << "  Gaussians: " << model.means.size(0);
+            if (reportBrushMetrics && nBrush > 0) {
+                std::cout << "\n  Brush-style PSNR:  " << (sumBrushPsnr / nBrush)
+                          << "  Brush-style SSIM:  " << (sumBrushSsim / nBrush);
+            }
+            std::cout << std::endl;
         }
 
         // Validation

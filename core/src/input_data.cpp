@@ -171,16 +171,34 @@ static MTensor buildEdgeMapFromImage(const MTensor &image) {
     return edges;
 }
 
-void Camera::loadImage(float downscaleFactor, const std::string &maskDir) {
+static void computeTargetSize(int srcW, int srcH, float downscaleFactor, int maxResolution,
+                              int &targetW, int &targetH) {
+    targetW = srcW;
+    targetH = srcH;
+    if (srcW <= 0 || srcH <= 0) return;
+
+    float scale = 1.0f;
+    if (maxResolution > 0) {
+        int maxDim = std::max(std::max(srcW, srcH), maxResolution);
+        scale = std::min(scale, (float)maxResolution / (float)maxDim);
+    }
+    if (downscaleFactor > 1.0f) scale /= downscaleFactor;
+
+    if (scale >= 1.0f) return;
+    targetW = std::max(1, (int)(srcW * scale));
+    targetH = std::max(1, (int)(srcH * scale));
+}
+
+void Camera::loadImage(float downscaleFactor, const std::string &maskDir, int maxResolution) {
     // Save original metadata dimensions for computing final target
     int metaW = width, metaH = height;
+    int targetW = metaW, targetH = metaH;
+    computeTargetSize(metaW, metaH, downscaleFactor, maxResolution, targetW, targetH);
 
     // Decode close to the final target when metadata dimensions are known.
     // Any residual 1px mismatch still goes through the regular resize path below.
     int thumbMaxDim = 0;
-    if (downscaleFactor > 1.0f && metaW > 0 && metaH > 0) {
-        int targetW = (int)(metaW / downscaleFactor);
-        int targetH = (int)(metaH / downscaleFactor);
+    if (targetW > 0 && targetH > 0 && (targetW != metaW || targetH != metaH)) {
         thumbMaxDim = std::max(targetW, targetH);
     }
 
@@ -214,18 +232,24 @@ void Camera::loadImage(float downscaleFactor, const std::string &maskDir) {
         width = raw.width; height = raw.height;
     }
 
-    // Downscale to final target (computed from original metadata, not intermediate)
-    if (downscaleFactor > 1.0f) {
-        int newW = (int)(metaW / downscaleFactor);
-        int newH = (int)(metaH / downscaleFactor);
-        if (newW != width || newH != height) {
-            raw = resizeArea(raw, newW, newH);
-            if (!rawMask.empty()) rawMask = resizeAreaMask(rawMask, newW, newH);
-        }
-        float sx = (float)newW / (float)width;
-        float sy = (float)newH / (float)height;
+    // Resize to the final target (computed from original metadata, not intermediate).
+    if (targetW > 0 && targetH > 0 && (targetW != width || targetH != height)) {
+        raw = resizeArea(raw, targetW, targetH);
+        if (!rawMask.empty()) rawMask = resizeAreaMask(rawMask, targetW, targetH);
+        float sx = (float)targetW / (float)width;
+        float sy = (float)targetH / (float)height;
         fx *= sx; fy *= sy; cx *= sx; cy *= sy;
-        width = newW; height = newH;
+        width = targetW; height = targetH;
+    } else if ((metaW == 0 || metaH == 0) && (downscaleFactor > 1.0f || maxResolution > 0)) {
+        computeTargetSize(width, height, downscaleFactor, maxResolution, targetW, targetH);
+        if (targetW != width || targetH != height) {
+            raw = resizeArea(raw, targetW, targetH);
+            if (!rawMask.empty()) rawMask = resizeAreaMask(rawMask, targetW, targetH);
+            float sx = (float)targetW / (float)width;
+            float sy = (float)targetH / (float)height;
+            fx *= sx; fy *= sy; cx *= sx; cy *= sy;
+            width = targetW; height = targetH;
+        }
     }
 
     // Undistort if needed — save state for lazy reload
@@ -256,7 +280,7 @@ void Camera::loadImage(float downscaleFactor, const std::string &maskDir) {
     if (!rawMask.empty()) mask = std::move(rawMask);
 }
 
-void Camera::loadMetadataOnly(float downscaleFactor, const std::string &maskDir) {
+void Camera::loadMetadataOnly(float downscaleFactor, const std::string &maskDir, int maxResolution) {
     int metaW = width, metaH = height;
 
     // Read actual file dimensions to correct intrinsics when metadata
@@ -275,7 +299,7 @@ void Camera::loadMetadataOnly(float downscaleFactor, const std::string &maskDir)
         }
     } else if (metaW <= 0 || metaH <= 0) {
         // Can't determine dimensions at all — fall back to full decode.
-        loadImage(downscaleFactor, maskDir);
+        loadImage(downscaleFactor, maskDir, maxResolution);
         releaseCPUData();
         return;
     }
@@ -288,14 +312,15 @@ void Camera::loadMetadataOnly(float downscaleFactor, const std::string &maskDir)
         maskFromAlpha_ = true;
     }
 
-    // Apply downscale to intrinsics
-    if (downscaleFactor > 1.0f) {
-        int newW = (int)(metaW / downscaleFactor);
-        int newH = (int)(metaH / downscaleFactor);
-        float sx = (float)newW / (float)width;
-        float sy = (float)newH / (float)height;
+    // Apply max-resolution cap and optional downscale to intrinsics.
+    int targetW = width;
+    int targetH = height;
+    computeTargetSize(metaW, metaH, downscaleFactor, maxResolution, targetW, targetH);
+    if (targetW != width || targetH != height) {
+        float sx = (float)targetW / (float)width;
+        float sy = (float)targetH / (float)height;
         fx *= sx; fy *= sy; cx *= sx; cy *= sy;
-        width = newW; height = newH;
+        width = targetW; height = targetH;
     }
 
     // Compute undistortion geometry (no pixel data needed)
