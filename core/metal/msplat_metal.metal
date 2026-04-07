@@ -1041,6 +1041,7 @@ kernel void rasterize_backward_kernel(
     constant int& densification_mode,
     device atomic_float* densify_vis,
     device atomic_float* densify_score,
+    device atomic_float* step_visibility,
     device atomic_float* v_xy, // float2
     device atomic_float* v_conic, // float3
     device atomic_float* v_rgb, // float3
@@ -1263,6 +1264,9 @@ kernel void rasterize_backward_kernel(
                 if (densification_mode == 1 || densification_mode == 2) {
                     atomic_fetch_add_explicit(densify_vis + b_id, densify_vis_local, memory_order_relaxed);
                     atomic_fetch_add_explicit(densify_score + b_id, densify_score_local, memory_order_relaxed);
+                    if (densification_mode == 2 && densify_vis_local > 0.0f) {
+                        atomic_fetch_add_explicit(step_visibility + b_id, 1.0f, memory_order_relaxed);
+                    }
                 }
             }
         }
@@ -3159,6 +3163,7 @@ kernel void rasterize_backward_chunked_kernel(
     constant int& densification_mode,
     device atomic_float* densify_vis,
     device atomic_float* densify_score,
+    device atomic_float* step_visibility,
     device atomic_float* v_xy,
     device atomic_float* v_conic,
     device atomic_float* v_rgb,
@@ -3362,6 +3367,9 @@ kernel void rasterize_backward_chunked_kernel(
                 if (densification_mode == 1 || densification_mode == 2) {
                     atomic_fetch_add_explicit(densify_vis + b_id, densify_vis_local, memory_order_relaxed);
                     atomic_fetch_add_explicit(densify_score + b_id, densify_score_local, memory_order_relaxed);
+                    if (densification_mode == 2 && densify_vis_local > 0.0f) {
+                        atomic_fetch_add_explicit(step_visibility + b_id, 1.0f, memory_order_relaxed);
+                    }
                 }
             }
         }

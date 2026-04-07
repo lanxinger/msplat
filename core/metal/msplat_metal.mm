@@ -35,6 +35,7 @@ static constexpr int N_TRAIN_STAGES = 8;
 static constexpr uint32_t kMaxTileElems = 4096;
 static constexpr uint32_t kOverflowTileElems = 1u << 0;
 static constexpr uint32_t kOverflowPackedCapacity = 1u << 1;
+static constexpr int64_t kMaxCapacityMultiplier = 64;
 
 static std::mutex g_stage_timing_mutex;
 // Per-stage accumulated times (ms), indexed by stage
@@ -632,6 +633,13 @@ static void maybe_warn_overflow(MetalContext* ctx, int num_points, int iter_coun
         fprintf(stderr,
                 "WARNING: packed intersection buffer capacity exceeded. "
                 "Raster work was clipped to the allocated packed buffers.\n");
+        if (g_tcache.capacity_multiplier < kMaxCapacityMultiplier) {
+            g_tcache.capacity_multiplier = std::min<int64_t>(
+                g_tcache.capacity_multiplier * 2, kMaxCapacityMultiplier);
+            fprintf(stderr,
+                    "INFO: increasing packed intersection capacity multiplier to %lld for later iterations.\n",
+                    (long long)g_tcache.capacity_multiplier);
+        }
     }
 
     g_overflow_warned_mask |= new_flags;
@@ -1161,6 +1169,7 @@ MTensor msplat_train_step(
     float adam_step_sizes[], float adam_bc2_sqrts[],
     float adam_beta1, float adam_beta2, float adam_eps,
     MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
+    MTensor &step_visibility,
     float inv_max_dim,
     int densification_mode,
     int alpha_mode,
@@ -1429,9 +1438,10 @@ MTensor msplat_train_step(
             ENC_BUF(enc, v_alpha_img, 11); ENC_BUF(enc, densify_error_map, 12);
             ENC_SCALAR(enc, densification_mode, 13);
             ENC_BUF(enc, vis_counts, 14); ENC_BUF(enc, xys_grad_norm, 15);
-            ENC_BUF(enc, v_xy, 16); ENC_BUF(enc, v_conic, 17);
-            ENC_BUF(enc, v_colors_rast, 18); ENC_BUF(enc, v_opacity, 19);
-            ENC_BUF(enc, out_img, 20);
+            ENC_BUF(enc, step_visibility, 16);
+            ENC_BUF(enc, v_xy, 17); ENC_BUF(enc, v_conic, 18);
+            ENC_BUF(enc, v_colors_rast, 19); ENC_BUF(enc, v_opacity, 20);
+            ENC_BUF(enc, out_img, 21);
             [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
         } else {
             // Chunked backward
@@ -1462,10 +1472,11 @@ MTensor msplat_train_step(
             ENC_BUF(enc, v_rendered, 13); ENC_BUF(enc, v_alpha_img, 14);
             ENC_BUF(enc, densify_error_map, 15); ENC_SCALAR(enc, densification_mode, 16);
             ENC_BUF(enc, vis_counts, 17); ENC_BUF(enc, xys_grad_norm, 18);
-            ENC_BUF(enc, v_xy, 19); ENC_BUF(enc, v_conic, 20);
-            ENC_BUF(enc, v_colors_rast, 21); ENC_BUF(enc, v_opacity, 22);
-            ENC_SCALAR(enc, BWD_CHUNK_SIZE, 23); ENC_SCALAR(enc, bwd_K_max, 24);
-            ENC_BUF(enc, out_img, 25);
+            ENC_BUF(enc, step_visibility, 19);
+            ENC_BUF(enc, v_xy, 20); ENC_BUF(enc, v_conic, 21);
+            ENC_BUF(enc, v_colors_rast, 22); ENC_BUF(enc, v_opacity, 23);
+            ENC_SCALAR(enc, BWD_CHUNK_SIZE, 24); ENC_SCALAR(enc, bwd_K_max, 25);
+            ENC_BUF(enc, out_img, 26);
             [enc dispatchThreadgroups:MTLSizeMake(tile_x, tile_y, bwd_K_max) threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
         }
     };
@@ -1563,6 +1574,7 @@ MTensor msplat_train_step(
         [blit fillBuffer:v_colors_rast.buffer() range:NSMakeRange(0, v_colors_rast.nbytes()) value:0];
         [blit fillBuffer:v_opacity.buffer() range:NSMakeRange(0, v_opacity.nbytes()) value:0];
         [blit fillBuffer:v_depth.buffer() range:NSMakeRange(0, v_depth.nbytes()) value:0];
+        [blit fillBuffer:step_visibility.buffer() range:NSMakeRange(0, step_visibility.nbytes()) value:0];
         [blit fillBuffer:v_mean3d.buffer() range:NSMakeRange(0, v_mean3d.nbytes()) value:0];
         [blit fillBuffer:v_scale.buffer() range:NSMakeRange(0, v_scale.nbytes()) value:0];
         [blit fillBuffer:v_quat.buffer() range:NSMakeRange(0, v_quat.nbytes()) value:0];

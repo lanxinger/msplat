@@ -108,6 +108,7 @@ struct Model{
   MTensor xysGradNorm;
   MTensor visCounts;
   MTensor max2DSize;
+  MTensor stepVisibility;
   MTensor refineWeightMax;
   MTensor errorScoreMax;
 

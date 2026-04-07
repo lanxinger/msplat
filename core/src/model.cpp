@@ -1146,6 +1146,7 @@ void Model::releaseOptimizers(){
     densify_keep_count_readback.reset();
     densify_block_totals.reset(); densify_compact_scratch.reset();
     donorIndexScratch.reset();
+    stepVisibility.reset();
     refineWeightMax.reset();
     errorScoreMax.reset();
 }
@@ -1351,7 +1352,7 @@ void Model::applyMeanNoise(int step) {
         quats,
         opacities,
         radii,
-        nullptr,
+        stepVisibility.defined() ? &stepVisibility : nullptr,
         0.0f,
         (uint32_t)(step ^ 0x9E3779B9u)
     );
@@ -1772,11 +1773,12 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight, 
     }
 
     if (!xysGradNorm.defined()) {
-    
         xysGradNorm = gpu_zeros({numPoints}, DType::Float32);
         visCounts = gpu_zeros({numPoints}, DType::Float32);
         max2DSize = gpu_zeros({numPoints}, DType::Float32);
     }
+    if (!stepVisibility.defined() || stepVisibility.size(0) < numPoints)
+        stepVisibility = gpu_zeros({numPoints}, DType::Float32);
 
     float invMaxDim = 1.0f / static_cast<float>((std::max)(lastHeight, lastWidth));
     float lossInvN = 1.0f / (float)(s.height * s.width * 3);
@@ -1816,7 +1818,7 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight, 
         adam_p, adam_ea, adam_eas,
         adam_ss, adam_bc2s,
         adam_beta1, adam_beta2, adam_eps,
-        visCounts, xysGradNorm, max2DSize, invMaxDim, densificationMode,
+        visCounts, xysGradNorm, max2DSize, stepVisibility, invMaxDim, densificationMode,
         alphaMode == AlphaMode::Masked ? 0 : 1,
         matchAlphaWeight,
         maskForLoss,

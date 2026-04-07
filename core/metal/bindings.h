@@ -84,6 +84,7 @@ MTensor msplat_train_step(
     float adam_step_sizes[], float adam_bc2_sqrts[],
     float adam_beta1, float adam_beta2, float adam_eps,
     MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
+    MTensor &step_visibility,
     float inv_max_dim,
     int densification_mode,
     int alpha_mode,
